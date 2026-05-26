@@ -836,6 +836,7 @@ input:checked + .toggle-slider:before { transform: translateX(18px); background:
       <button class="btn btn-primary" style="width:100%;justify-content:center;margin-top:10px" onclick="applyZoneNames()">Aplicar Nomes</button>
     </div>
 
+    <button class="btn btn-ghost" style="width:100%;justify-content:center;margin-bottom:8px" onclick="recalibrate()">🔧 Recalibrar Fundo</button>
     <button class="btn btn-danger" style="width:100%;justify-content:center" onclick="resetSession()">🗑 Resetar Sessão</button>
   </div>
 
@@ -945,12 +946,14 @@ async function startCamera() {
       initGazeCanvas();
     };
     trackFPS();
+    BG.model = null;
+    MO.currBlobs = [];
     MO.worker = setInterval(analyzeFrame, 200);
     setInterval(updateSessionTimer, 1000);
     setInterval(updateZoneTimes, 1000);
     historyInterval = setInterval(recordHistory, 10000);
     if (document.getElementById('wakeLockToggle').checked) requestWakeLock();
-    addLog('Câmera iniciada · Análise ativa', 'g');
+    addLog('Câmera iniciada · Calibrando fundo (6s)...', 'g');
   } catch(e) {
     addLog('Erro câmera: ' + e.message, 'r');
     alert('Câmera indisponível:\n' + e.message);
@@ -987,64 +990,271 @@ function trackFPS() {
 }
 
 // ══════════════════════════════════════════
-//  MOTION + ZONE ANALYSIS
+//  MOTION + ZONE ANALYSIS  (v2 — anti falso-positivo)
 // ══════════════════════════════════════════
 const GRID_COLS = 4, GRID_ROWS = 4;
 const HMAP_COLS = 20, HMAP_ROWS = 15;
-let heatDecay = 0;
+
+// ── BACKGROUND MODEL ──
+// Aprende o fundo ao longo do tempo (Mixture of Gaussians simplificado).
+// TV, tapete, roupas no chão → mudam de forma CONTÍNUA → são absorvidas
+// como fundo com o tempo e param de gerar detecção.
+const BG = {
+  model: null,
+  variance: null,
+  frameCount: 0,
+  LEARN_RATE: 0.04,      // fundo estático: aprender moderado
+  LEARN_RATE_SLOW: 0.015,// foreground persistente (TV): absorver devagar mas absorver
+  LEARN_RATE_TV: 0.035,  // movimento periódico (TV piscando): absorver mais rápido
+  CALIB_FRAMES: 50,      // ~10s de calibração inicial (mais robusto)
+  calibrated: false,
+  // Buffer de variância temporal por pixel: detecta pixels que piscam
+  // periodicamente (TV) — eles têm variância ALTA e são suprimidos
+  tvSuppress: null,      // Float32Array: acumula variância histórica por pixel
+};
+
+// ── BLOB DETECTOR ──
+// Filtros para distinguir pessoa de objeto/TV/tapete:
+// 1. TAMANHO: blob de pessoa ocupa área razoável no frame
+// 2. PROPORÇÃO: silhueta humana tem altura > largura (vertical)
+// 3. DESLOCAMENTO: pessoa se move entre frames (TV permanece no mesmo lugar)
+// 4. DENSIDADE: TV/tapete gera blob muito denso e uniforme; pessoa é irregular
+const BLOB = {
+  MIN_AREA: 25,          // maior → exige blob mais sólido (reduz TV/tapete)
+  MAX_AREA: 280,         // acima disso é ruído global
+  MIN_ASPECT: 0.2,       // largura/altura mínima
+  MAX_ASPECT: 2.2,       // largura/altura máxima — TV tende a ser muito larga
+  MIN_HEIGHT_CELLS: 2,   // blob deve ter pelo menos 2 células de altura (pessoa tem altura)
+  MAX_DENSITY: 0.85,     // blobs muito densos (>85% das células preenchidas) = TV/objeto, não pessoa
+  blobHistory: [],
+  // Rastrear posição de blobs entre frames para detectar deslocamento
+  prevBlobs: [],
+  MIN_DISPLACEMENT: 0.3, // blob deve se deslocar ao menos 0.3 células entre frames
+                          // (TV fica parada; pessoa se move)
+  staleFrames: [],        // quantos frames cada blob ficou parado
+  MAX_STALE: 15,          // blob parado por >15 frames → provavelmente objeto estático
+};
+
+// ── TEMPORAL BUFFER ──
+const TEMPORAL = {
+  buffer: [],
+  WINDOW: 7,             // janela maior → mais estável, menos falso-positivo
+  stable: 0,
+};
+
+// Resolução maior para melhor detecção de blobs
+MO.W = 80; MO.H = 60;
+MO.capCanvas.width = MO.W; MO.capCanvas.height = MO.H;
+
+function initBGModel() {
+  const N = MO.W * MO.H;
+  BG.model      = new Float32Array(N).fill(128);
+  BG.variance   = new Float32Array(N).fill(900);
+  BG.tvSuppress = new Float32Array(N).fill(0);
+  BG.frameCount = 0;
+  BG.calibrated = false;
+  TEMPORAL.buffer = [];
+  TEMPORAL.stable = 0;
+  BLOB.blobHistory = [];
+  BLOB.prevBlobs   = [];
+  BLOB.staleFrames = [];
+  addLog('🔧 Calibrando fundo — aguarde 10s', 'c');
+}
 
 function analyzeFrame() {
   if (!isRunning || !video.videoWidth) return;
 
   MO.capCtx.drawImage(video, 0, 0, MO.W, MO.H);
-  const curr = MO.capCtx.getImageData(0, 0, MO.W, MO.H).data;
+  const raw = MO.capCtx.getImageData(0, 0, MO.W, MO.H).data;
 
-  if (!MO.prevFrame) { MO.prevFrame = curr.slice(); return; }
-
-  const thresh = (11 - sensitivity) * 2.5;
-
-  // Reset grid
-  const grid = new Array(GRID_COLS * GRID_ROWS).fill(0);
-  const hmap = new Array(HMAP_COLS * HMAP_ROWS).fill(0);
-  const gw = MO.W / HMAP_COLS, gh = MO.H / HMAP_ROWS;
-
-  let totalMotion = 0;
-
-  for (let py = 0; py < MO.H; py++) {
-    for (let px = 0; px < MO.W; px++) {
-      const idx = (py * MO.W + px) * 4;
-      const dr = Math.abs(curr[idx]   - MO.prevFrame[idx]);
-      const dg = Math.abs(curr[idx+1] - MO.prevFrame[idx+1]);
-      const db = Math.abs(curr[idx+2] - MO.prevFrame[idx+2]);
-      const diff = (dr + dg + db) / 3;
-      if (diff > thresh) {
-        // Grid cell
-        const gc = Math.floor((px / MO.W) * GRID_COLS);
-        const gr = Math.floor((py / MO.H) * GRID_ROWS);
-        grid[gr * GRID_COLS + gc]++;
-        // Heatmap cell
-        const hc = Math.floor(px / gw);
-        const hr = Math.floor(py / gh);
-        const hIdx = hr * HMAP_COLS + hc;
-        if (hIdx < hmap.length) hmap[hIdx] += diff;
-        totalMotion += diff;
-      }
-    }
+  // Converter para escala de cinza
+  const gray = new Float32Array(MO.W * MO.H);
+  for (let i = 0; i < MO.W * MO.H; i++) {
+    gray[i] = 0.299 * raw[i*4] + 0.587 * raw[i*4+1] + 0.114 * raw[i*4+2];
   }
 
-  MO.prevFrame = curr.slice();
+  // ── FASE 1: Inicializar modelo de fundo ──
+  if (!BG.model) { initBGModel(); BG.model.set(gray); return; }
 
-  // Update gaze heatmap (accumulate + decay)
+  BG.frameCount++;
+
+  // ── FASE 2: Gerar máscara de foreground ──
+  // Pixel é foreground se desviar mais que K*sigma do modelo de fundo.
+  // K=2.5 → equivale a ~99% de confiança (menos falsos).
+  const K = 2.5 + (10 - sensitivity) * 0.3; // sensibilidade ajusta K
+  const fgMask = new Uint8Array(MO.W * MO.H);
+  const hmap   = new Array(HMAP_COLS * HMAP_ROWS).fill(0);
+  const gw = MO.W / HMAP_COLS, gh = MO.H / HMAP_ROWS;
+
+  for (let i = 0; i < gray.length; i++) {
+    const diff = gray[i] - BG.model[i];
+    const sigma = Math.sqrt(BG.variance[i]);
+    const isFG = Math.abs(diff) > K * sigma;
+
+    if (isFG) {
+      fgMask[i] = 1;
+      const px = i % MO.W, py = Math.floor(i / MO.W);
+      const hc = Math.min(HMAP_COLS-1, Math.floor(px / gw));
+      const hr = Math.min(HMAP_ROWS-1, Math.floor(py / gh));
+      hmap[hr * HMAP_COLS + hc] += Math.abs(diff);
+    }
+
+    // ── Atualizar modelo de fundo ──
+    // Pixels FG que se repetem muito (TV, tapete): absorver mais rápido com o tempo
+    // tvSuppress acumula quanto esse pixel costuma ser FG → se sempre FG = não é pessoa
+    BG.tvSuppress[i] += isFG ? 0.04 : -0.01;
+    BG.tvSuppress[i]  = Math.max(0, Math.min(1, BG.tvSuppress[i]));
+
+    // Quanto mais "cronicamente ativo" o pixel, mais rápido vira fundo
+    const suppressBoost = BG.tvSuppress[i] * 0.04;
+    const lr = isFG
+      ? BG.LEARN_RATE_SLOW + suppressBoost  // FG: absorver devagar, mas mais rápido se TV
+      : BG.LEARN_RATE;                       // fundo: aprender normal
+
+    BG.model[i]    += lr * (gray[i] - BG.model[i]);
+    const newVar    = (gray[i] - BG.model[i]) ** 2;
+    BG.variance[i] += lr * (newVar - BG.variance[i]);
+    BG.variance[i]  = Math.max(BG.variance[i], 64);
+
+    // Pixel cronicamente ativo (tvSuppress alto): suprimir do foreground
+    // Isso elimina TV, tapete colorido, roupa no chão que ficam parados
+    if (BG.tvSuppress[i] > 0.75) fgMask[i] = 0;
+  }
+
+  // Atualizar heatmap de atenção
   for (let i = 0; i < MO.gazeHeat.length; i++) {
     MO.gazeHeat[i] = MO.gazeHeat[i] * 0.97 + hmap[i] * 0.3;
   }
 
-  // Count active zones (threshold: >8% of cells in zone active)
-  const cellsPerZone = (MO.W / GRID_COLS * MO.H / GRID_ROWS);
-  const motionThreshCell = thresh * 2;
+  if (BG.frameCount < BG.CALIB_FRAMES) {
+    updatePeopleUI(0);
+    drawOverlay(new Array(16).fill(0), { A:0, B:0, C:0, D:0 });
+    // Mostrar progresso da calibração
+    const pct = Math.round((BG.frameCount / BG.CALIB_FRAMES) * 100);
+    document.getElementById('detectEl').textContent = `cal ${pct}%`;
+    if (BG.frameCount === BG.CALIB_FRAMES - 1) {
+      BG.calibrated = true;
+      addLog('✅ Calibração concluída — anti-TV ativo', 'g');
+    }
+    return;
+  }
 
-  // Each zone = one 2x2 block of the 4x4 grid
-  // A=top-left, B=top-right, C=bottom-left, D=bottom-right
+  // ── FASE 3: Morfologia (erosão simples) ──
+  // Remove ruído isolado (pixel único) antes de detectar blobs
+  const cleaned = new Uint8Array(MO.W * MO.H);
+  for (let py = 1; py < MO.H-1; py++) {
+    for (let px = 1; px < MO.W-1; px++) {
+      const i = py * MO.W + px;
+      if (!fgMask[i]) continue;
+      // Precisa ter pelo menos 2 vizinhos também FG
+      const neighbors =
+        fgMask[i-1] + fgMask[i+1] +
+        fgMask[i-MO.W] + fgMask[i+MO.W];
+      if (neighbors >= 2) cleaned[i] = 1;
+    }
+  }
+
+  // ── FASE 4: Detecção de blobs (componentes conectados simplificado) ──
+  // Usa o grid 4x4 para agrupar regiões ativas
+  const cellW = MO.W / GRID_COLS, cellH = MO.H / GRID_ROWS;
+  const grid  = new Array(GRID_COLS * GRID_ROWS).fill(0);
+
+  for (let i = 0; i < cleaned.length; i++) {
+    if (!cleaned[i]) continue;
+    const px = i % MO.W, py = Math.floor(i / MO.W);
+    const gc = Math.min(GRID_COLS-1, Math.floor(px / cellW));
+    const gr = Math.min(GRID_ROWS-1, Math.floor(py / cellH));
+    grid[gr * GRID_COLS + gc]++;
+  }
+
+  // Encontrar blobs contíguos no grid
+  const visited = new Array(GRID_COLS * GRID_ROWS).fill(false);
+  const blobs   = [];
+
+  for (let start = 0; start < grid.length; start++) {
+    if (visited[start] || grid[start] < 3) continue; // célula vazia
+    // BFS para encontrar blob conectado
+    const queue = [start];
+    visited[start] = true;
+    let area = 0, minC = GRID_COLS, maxC = 0, minR = GRID_ROWS, maxR = 0;
+
+    while (queue.length) {
+      const cur = queue.shift();
+      const cc = cur % GRID_COLS, cr = Math.floor(cur / GRID_COLS);
+      area += grid[cur];
+      minC = Math.min(minC, cc); maxC = Math.max(maxC, cc);
+      minR = Math.min(minR, cr); maxR = Math.max(maxR, cr);
+
+      // Vizinhos 4-conectados
+      [[0,1],[0,-1],[1,0],[-1,0]].forEach(([dc,dr]) => {
+        const nc = cc+dc, nr = cr+dr;
+        if (nc < 0 || nc >= GRID_COLS || nr < 0 || nr >= GRID_ROWS) return;
+        const ni = nr * GRID_COLS + nc;
+        if (visited[ni] || grid[ni] < 3) return;
+        visited[ni] = true;
+        queue.push(ni);
+      });
+    }
+
+    // Validar como silhueta humana
+    const blobW  = maxC - minC + 1;
+    const blobH  = maxR - minR + 1;
+    const aspect = blobH === 0 ? 0 : blobW / blobH;
+
+    // Densidade: blobs muito densos e uniformes = objeto/TV, não pessoa
+    const totalCellsInBox = blobW * blobH;
+    const density = totalCellsInBox > 0 ? area / totalCellsInBox : 0;
+
+    // Verificar deslocamento em relação ao frame anterior
+    // Pessoa se move; TV, tapete e roupa no chão ficam parados
+    const cx = (minC + maxC) / 2, cy = (minR + maxR) / 2;
+    let minDist = Infinity;
+    BLOB.prevBlobs.forEach(pb => {
+      const d = Math.sqrt((cx - pb.cx)**2 + (cy - pb.cy)**2);
+      if (d < minDist) minDist = d;
+    });
+    // Se não havia blob anterior, aceitar (primeira detecção)
+    const hasMovement = BLOB.prevBlobs.length === 0 || minDist >= BLOB.MIN_DISPLACEMENT;
+
+    // Rastrear blobs parados (sem deslocamento por muitos frames)
+    const blobKey = `${Math.round(cx)}_${Math.round(cy)}`;
+    if (!hasMovement) {
+      BLOB.staleFrames[blobKey] = (BLOB.staleFrames[blobKey] || 0) + 1;
+    } else {
+      BLOB.staleFrames[blobKey] = 0;
+    }
+    const isStale = (BLOB.staleFrames[blobKey] || 0) > BLOB.MAX_STALE;
+
+    if (
+      area     >= BLOB.MIN_AREA     &&   // grande o suficiente
+      area     <= BLOB.MAX_AREA     &&   // não é ruído global
+      aspect   >= BLOB.MIN_ASPECT   &&   // proporção mínima
+      aspect   <= BLOB.MAX_ASPECT   &&   // não é muito largo (TV widescreen)
+      blobH    >= BLOB.MIN_HEIGHT_CELLS &&// tem altura mínima (pessoa tem altura)
+      density  <= BLOB.MAX_DENSITY  &&   // não é objeto denso/uniforme
+      !isStale                           // está se movendo (não é objeto parado)
+    ) {
+      blobs.push({ area, minC, maxC, minR, maxR, cx, cy, density });
+    }
+  }
+
+  BLOB.prevBlobs = blobs.map(b => ({ cx: b.cx, cy: b.cy }));
+
+  // ── FASE 5: Estabilização temporal ──
+  // Só conta como pessoa se blob persistir por ≥ TEMPORAL_MIN frames
+  TEMPORAL.buffer.push(blobs.length);
+  if (TEMPORAL.buffer.length > TEMPORAL.WINDOW) TEMPORAL.buffer.shift();
+
+  // Mediana dos últimos frames (robusta a outliers)
+  const sorted = [...TEMPORAL.buffer].sort((a,b) => a-b);
+  const medianCount = sorted[Math.floor(sorted.length / 2)];
+  TEMPORAL.stable = medianCount;
+
+  MO.currPeople = TEMPORAL.stable;
+  MO.currBlobs  = blobs;
+
+  // ── FASE 6: Zonas ──
+  const motionThreshCell = 5;
   const zoneMotion = {
     A: grid[0]+grid[1]+grid[4]+grid[5],
     B: grid[2]+grid[3]+grid[6]+grid[7],
@@ -1052,23 +1262,16 @@ function analyzeFrame() {
     D: grid[10]+grid[11]+grid[14]+grid[15],
   };
 
-  // Estimate people count from total motion (rough heuristic)
-  const activeCells = grid.filter(v => v > motionThreshCell).length;
-  let estimatedPeople = Math.min(20, Math.floor(activeCells / 1.5));
-  MO.currPeople = estimatedPeople;
-
-  // Update zone active state
   let zonesActiveCount = 0;
   Object.entries(zoneMotion).forEach(([key, val]) => {
-    const isActive = val > motionThreshCell * 2;
+    const isActive = val > motionThreshCell * 4;
     if (isActive) zonesActiveCount++;
     updateZoneActive(key, isActive, val);
   });
   document.getElementById('zonesActive').textContent = zonesActiveCount;
 
-  // Update gaze attention bars from heatmap quadrants
-  const totalHeat = MO.gazeHeat.reduce((a,b) => a+b, 0) || 1;
-  const quadrantHeat = [0,0,0,0]; // TL, TR, C, BR
+  // Atenção por quadrante
+  const quadrantHeat = [0,0,0,0];
   MO.gazeHeat.forEach((v, i) => {
     const col = i % HMAP_COLS, row = Math.floor(i / HMAP_COLS);
     const isLeft = col < HMAP_COLS/2, isTop = row < HMAP_ROWS/2;
@@ -1079,22 +1282,17 @@ function analyzeFrame() {
     else quadrantHeat[3] += v;
   });
   const qTotal = quadrantHeat.reduce((a,b) => a+b, 0) || 1;
-  const gids = ['gazeA','gazeB','gazeC','gazeD'];
-  const gpids = ['gazeApct','gazeBpct','gazeCpct','gazeDpct'];
-  quadrantHeat.forEach((v,i) => {
-    const pct = Math.round((v/qTotal)*100);
-    document.getElementById(gids[i]).style.width = pct + '%';
-    document.getElementById(gpids[i]).textContent = pct + '%';
+  ['gazeA','gazeB','gazeC','gazeD'].forEach((id,i) => {
+    const pct = Math.round((quadrantHeat[i]/qTotal)*100);
+    document.getElementById(id).style.width = pct + '%';
+    document.getElementById(id+'pct').textContent = pct + '%';
   });
 
-  // Update UI
-  updatePeopleUI(estimatedPeople);
+  updatePeopleUI(TEMPORAL.stable);
   drawOverlay(grid, zoneMotion);
   renderGazeHeatmap();
   renderHistoryChart();
-
-  // Manage visitors
-  manageVisitors(estimatedPeople, zoneMotion, motionThreshCell);
+  manageVisitors(TEMPORAL.stable, zoneMotion, motionThreshCell * 4);
 }
 
 // ══════════════════════════════════════════
@@ -1328,22 +1526,58 @@ function drawOverlay(grid, zoneMotion) {
     });
   });
 
-  // People count badge
-  if (MO.currPeople > 0) {
-    octx.fillStyle = 'rgba(0,212,255,0.9)';
-    octx.font = `bold 14px 'Space Mono'`;
-    const badge = `${MO.currPeople} pessoa${MO.currPeople>1?'s':''}`;
-    const bw = octx.measureText(badge).width + 20;
+  // ── Desenhar bounding boxes dos blobs detectados (pessoas) ──
+  if (MO.currBlobs && MO.currBlobs.length > 0) {
+    const cellW = W / GRID_COLS, cellH = H / GRID_ROWS;
+    MO.currBlobs.forEach((blob, idx) => {
+      const bx = blob.minC * cellW;
+      const by = blob.minR * cellH;
+      const bw = (blob.maxC - blob.minC + 1) * cellW;
+      const bh = (blob.maxR - blob.minR + 1) * cellH;
+
+      // Sombra verde pulsante em volta da pessoa
+      octx.shadowBlur = 12;
+      octx.shadowColor = '#2ecc8a';
+      octx.strokeStyle = '#2ecc8a';
+      octx.lineWidth = 2;
+      octx.setLineDash([]);
+      octx.strokeRect(bx + 2, by + 2, bw - 4, bh - 4);
+      octx.shadowBlur = 0;
+
+      // Fill leve
+      octx.fillStyle = 'rgba(46,204,138,0.08)';
+      octx.fillRect(bx + 2, by + 2, bw - 4, bh - 4);
+
+      // Label da pessoa
+      octx.font = "bold 10px 'Space Mono', monospace";
+      const label = `P${idx + 1}`;
+      const lw = octx.measureText(label).width + 10;
+      octx.fillStyle = 'rgba(0,0,0,0.75)';
+      octx.fillRect(bx + 2, by + 2, lw, 16);
+      octx.fillStyle = '#2ecc8a';
+      octx.fillText(label, bx + 7, by + 13);
+    });
+  }
+
+  // People count badge (topo centro)
+  {
+    const count = MO.currPeople || 0;
+    const badge = BG.calibrated
+      ? (count > 0 ? `${count} pessoa${count>1?'s':''}` : 'Nenhuma pessoa')
+      : '⏳ Calibrando...';
+    octx.font = `bold 13px 'Space Mono'`;
+    const bw = octx.measureText(badge).width + 22;
     octx.beginPath();
-    octx.roundRect(W/2 - bw/2, 8, bw, 28, 6);
-    octx.fillStyle = 'rgba(0,0,0,0.7)';
+    if (octx.roundRect) octx.roundRect(W/2 - bw/2, 8, bw, 26, 6);
+    else octx.rect(W/2 - bw/2, 8, bw, 26);
+    octx.fillStyle = 'rgba(0,0,0,0.75)';
     octx.fill();
-    octx.strokeStyle = '#00d4ff';
-    octx.lineWidth = 1;
+    octx.strokeStyle = count > 0 ? '#2ecc8a' : (BG.calibrated ? '#6a7d90' : '#00d4ff');
+    octx.lineWidth = 1.5;
     octx.stroke();
-    octx.fillStyle = '#00d4ff';
+    octx.fillStyle = count > 0 ? '#2ecc8a' : (BG.calibrated ? '#6a7d90' : '#00d4ff');
     octx.textAlign = 'center';
-    octx.fillText(badge, W/2, 26);
+    octx.fillText(badge, W/2, 25);
     octx.textAlign = 'left';
   }
 }
@@ -1515,12 +1749,27 @@ function applyZoneNames() {
   addLog('Nomes de zonas atualizados', 'g');
 }
 
+function recalibrate() {
+  BG.model = null;
+  BG.calibrated = false;
+  BG.frameCount = 0;
+  TEMPORAL.buffer = [];
+  TEMPORAL.stable = 0;
+  MO.currBlobs = [];
+  addLog('🔧 Recalibrando fundo...', 'c');
+}
+
 function resetSession() {
   if (!confirm('Resetar todos os dados da sessão?')) return;
   totalVisits = 0; peakOccupancy = 0; peakTime = null; alertCount = 0;
   visitDurations = []; occupancyHistory = []; visitors = []; visitorIdCounter = 0;
   Object.keys(ZONES).forEach(k => { ZONES[k].count = 0; ZONES[k].seconds = 0; });
+  if (BG.tvSuppress) BG.tvSuppress.fill(0);
+  BLOB.staleFrames = [];
+  BLOB.prevBlobs   = [];
   MO.gazeHeat.fill(0);
+  BG.model = null; BG.calibrated = false; BG.frameCount = 0;
+  TEMPORAL.buffer = []; TEMPORAL.stable = 0; MO.currBlobs = [];
   ['A','B','C','D'].forEach(k => { zoneActiveTimers[k] = 0; });
   ['totalToday','peakCount','aAlerts','aTotalVisits'].forEach(id => {
     const el = document.getElementById(id); if(el) el.textContent = '0';
