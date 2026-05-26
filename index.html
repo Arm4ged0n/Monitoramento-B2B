@@ -1,124 +1,1605 @@
-```html
 <!DOCTYPE html>
-<html lang="pt-PT">
+<html lang="pt-BR">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Retail Intelligence 2026 - Centro de Comando</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <style>
-        body { background-color: #020617; color: #f8fafc; font-family: 'Inter', sans-serif; }
-        .glass-card { background: rgba(15, 23, 42, 0.6); backdrop-filter: blur(12px); border: 1px solid rgba(255, 255, 255, 0.05); }
-        .stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 1rem; }
-        .scroll-custom::-webkit-scrollbar { width: 4px; }
-        .scroll-custom::-webkit-scrollbar-thumb { background: #334155; }
-    </style>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+<title>RetailEye — Análise de Comportamento em Loja</title>
+<link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=DM+Sans:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+
+:root {
+  --bg:       #080c10;
+  --surface:  #0e1318;
+  --card:     #141a20;
+  --card2:    #1a2028;
+  --border:   #232d38;
+  --border2:  #2d3a48;
+  --text:     #dde8f0;
+  --muted:    #6a7d90;
+  --cyan:     #00d4ff;
+  --orange:   #ff7a2f;
+  --green:    #2ecc8a;
+  --red:      #ff4757;
+  --yellow:   #ffc542;
+  --purple:   #a855f7;
+  --mono:     'Space Mono', monospace;
+  --sans:     'DM Sans', sans-serif;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--sans);
+  min-height: 100vh;
+  overflow-x: hidden;
+}
+
+/* ── SCANLINES OVERLAY ── */
+body::before {
+  content: '';
+  position: fixed; inset: 0; z-index: 0;
+  background: repeating-linear-gradient(0deg, transparent, transparent 2px, rgba(0,212,255,0.015) 2px, rgba(0,212,255,0.015) 4px);
+  pointer-events: none;
+}
+
+/* ── HEADER ── */
+header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 12px 16px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  position: sticky; top: 0; z-index: 200;
+  backdrop-filter: blur(8px);
+}
+.logo { display: flex; align-items: center; gap: 10px; }
+.logo-icon {
+  width: 34px; height: 34px;
+  background: linear-gradient(135deg, var(--cyan), #0090b3);
+  border-radius: 8px;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 17px;
+  box-shadow: 0 0 12px rgba(0,212,255,0.3);
+}
+.logo-name { font-family: var(--mono); font-size: 0.9rem; font-weight: 700; color: var(--cyan); letter-spacing: 1px; }
+.logo-sub  { font-size: 0.6rem; color: var(--muted); margin-top: 1px; letter-spacing: 0.5px; }
+
+.header-right { display: flex; align-items: center; gap: 10px; }
+.live-badge {
+  display: flex; align-items: center; gap: 5px;
+  padding: 4px 10px; border-radius: 20px;
+  font-family: var(--mono); font-size: 0.62rem; font-weight: 700;
+  background: var(--card); border: 1px solid var(--border2);
+  color: var(--muted); transition: all 0.3s;
+}
+.live-badge.on { border-color: var(--cyan); color: var(--cyan); background: rgba(0,212,255,0.08); }
+.live-dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+.live-badge.on .live-dot { animation: pulse 1s ease-in-out infinite; }
+@keyframes pulse { 0%,100%{opacity:1;transform:scale(1)} 50%{opacity:0.4;transform:scale(0.8)} }
+
+.session-timer {
+  font-family: var(--mono); font-size: 0.65rem;
+  color: var(--muted); padding: 4px 8px;
+  background: var(--card); border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+/* ── CAMERA ── */
+.cam-section {
+  background: #000;
+  position: relative;
+  width: 100%;
+  aspect-ratio: 4/3;
+  max-height: 52vh;
+  overflow: hidden;
+}
+video { width: 100%; height: 100%; object-fit: cover; display: none; }
+canvas#overlayCanvas { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; z-index: 10; }
+
+.no-cam {
+  position: absolute; inset: 0;
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 12px; background: #030507;
+}
+.no-cam-icon { font-size: 2.4rem; opacity: 0.3; }
+.no-cam p { font-size: 0.78rem; color: var(--muted); text-align: center; line-height: 1.6; }
+
+/* Zones overlay */
+.zone-overlay {
+  position: absolute; inset: 0;
+  pointer-events: none; display: none; z-index: 5;
+}
+
+/* Corner decorations */
+.cam-corner {
+  position: absolute; width: 16px; height: 16px;
+  border-color: var(--cyan); border-style: solid;
+  z-index: 15; opacity: 0.7;
+}
+.cam-corner.tl { top: 8px; left: 8px; border-width: 2px 0 0 2px; }
+.cam-corner.tr { top: 8px; right: 8px; border-width: 2px 2px 0 0; }
+.cam-corner.bl { bottom: 8px; left: 8px; border-width: 0 0 2px 2px; }
+.cam-corner.br { bottom: 8px; right: 8px; border-width: 0 2px 2px 0; }
+
+/* Scan line */
+.scan-line {
+  position: absolute; left: 0; right: 0; height: 1px;
+  background: linear-gradient(90deg, transparent 0%, rgba(0,212,255,0.6) 50%, transparent 100%);
+  z-index: 12; display: none;
+  animation: scanv 4s ease-in-out infinite;
+}
+@keyframes scanv { 0%{top:0;opacity:0} 5%{opacity:1} 95%{opacity:1} 100%{top:100%;opacity:0} }
+
+/* FPS / RES bar */
+.cam-bar {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 8px 14px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+}
+.cam-meta { display: flex; gap: 14px; flex-wrap: wrap; }
+.cam-meta span { font-family: var(--mono); font-size: 0.6rem; color: var(--muted); }
+.cam-meta b { color: var(--cyan); font-weight: 400; }
+.cam-actions { display: flex; gap: 8px; }
+
+.btn {
+  display: flex; align-items: center; gap: 5px;
+  padding: 7px 14px; border-radius: 6px;
+  font-family: var(--sans); font-size: 0.75rem; font-weight: 600;
+  cursor: pointer; transition: all 0.2s; border: 1px solid;
+  letter-spacing: 0.3px;
+}
+.btn-primary { background: var(--cyan); color: #000; border-color: var(--cyan); }
+.btn-primary:hover { opacity: 0.85; }
+.btn-danger  { background: transparent; color: var(--red); border-color: var(--red); }
+.btn-danger:hover { background: rgba(255,71,87,0.1); }
+.btn-ghost   { background: transparent; color: var(--muted); border-color: var(--border2); }
+.btn-ghost:hover { border-color: var(--cyan); color: var(--cyan); }
+.btn-sm { padding: 5px 10px; font-size: 0.68rem; }
+
+/* ── TABS ── */
+.tabs {
+  display: flex; gap: 0;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  overflow-x: auto;
+}
+.tab {
+  padding: 10px 16px; font-size: 0.72rem; font-weight: 600;
+  color: var(--muted); cursor: pointer; border-bottom: 2px solid transparent;
+  transition: all 0.2s; white-space: nowrap; letter-spacing: 0.3px;
+}
+.tab.active { color: var(--cyan); border-bottom-color: var(--cyan); }
+
+/* ── BODY ── */
+.body { padding: 12px; display: flex; flex-direction: column; gap: 12px; position: relative; z-index: 1; }
+
+/* Tab panels */
+.panel { display: none; flex-direction: column; gap: 12px; }
+.panel.active { display: flex; }
+
+/* ── SECTION TITLE ── */
+.section-title {
+  font-family: var(--mono); font-size: 0.6rem; font-weight: 700;
+  color: var(--muted); letter-spacing: 1.5px; text-transform: uppercase;
+  margin-bottom: 10px; display: flex; align-items: center; gap: 8px;
+}
+.section-title::after { content: ''; flex: 1; height: 1px; background: var(--border); }
+
+/* ── PEOPLE COUNTER HERO ── */
+.hero-counter {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 16px;
+  display: flex; flex-direction: column; gap: 14px;
+}
+.counter-row {
+  display: flex; align-items: center; justify-content: space-between;
+}
+.counter-big {
+  display: flex; align-items: flex-end; gap: 8px;
+}
+.counter-num {
+  font-family: var(--mono); font-size: 3.5rem; font-weight: 700;
+  color: var(--cyan); line-height: 1;
+  text-shadow: 0 0 20px rgba(0,212,255,0.4);
+}
+.counter-label { font-size: 0.75rem; color: var(--muted); margin-bottom: 8px; }
+.counter-badge {
+  padding: 5px 12px; border-radius: 20px; font-size: 0.68rem; font-weight: 700;
+  letter-spacing: 0.5px;
+}
+.badge-low   { background: rgba(46,204,138,0.12); color: var(--green);  border: 1px solid rgba(46,204,138,0.3); }
+.badge-med   { background: rgba(255,197,66,0.12); color: var(--yellow); border: 1px solid rgba(255,197,66,0.3); }
+.badge-high  { background: rgba(255,71,87,0.12);  color: var(--red);    border: 1px solid rgba(255,71,87,0.3); }
+
+.mini-stats { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; }
+.mini-stat {
+  background: var(--card2); border: 1px solid var(--border);
+  border-radius: 8px; padding: 10px;
+}
+.mini-stat-val {
+  font-family: var(--mono); font-size: 1.2rem; font-weight: 700;
+  color: var(--text); line-height: 1;
+}
+.mini-stat-val.cyan   { color: var(--cyan); }
+.mini-stat-val.orange { color: var(--orange); }
+.mini-stat-val.green  { color: var(--green); }
+.mini-stat-label { font-size: 0.58rem; color: var(--muted); margin-top: 3px; letter-spacing: 0.5px; text-transform: uppercase; }
+
+/* ── ZONES ── */
+.zones-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.zone-card {
+  background: var(--card); border: 1px solid var(--border);
+  border-radius: 10px; padding: 12px;
+  transition: border-color 0.3s, background 0.3s;
+  position: relative; overflow: hidden;
+}
+.zone-card::before {
+  content: ''; position: absolute;
+  top: 0; left: 0; right: 0; height: 2px;
+  background: var(--zone-color, var(--cyan));
+  opacity: 0.6;
+}
+.zone-card.active-zone { border-color: var(--zone-color, var(--cyan)); background: rgba(0,212,255,0.04); }
+.zone-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
+.zone-name { font-size: 0.7rem; font-weight: 600; color: var(--text); }
+.zone-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); transition: background 0.3s; }
+.zone-dot.active { background: var(--zone-color, var(--cyan)); box-shadow: 0 0 6px var(--zone-color, var(--cyan)); animation: pulse 1s infinite; }
+.zone-count { font-family: var(--mono); font-size: 1.8rem; font-weight: 700; color: var(--zone-color, var(--cyan)); line-height: 1; }
+.zone-time { font-size: 0.6rem; color: var(--muted); margin-top: 2px; }
+
+/* Zone setup */
+.zone-setup {
+  background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 14px;
+}
+.zone-list { display: flex; flex-direction: column; gap: 8px; margin-top: 10px; }
+.zone-item {
+  display: flex; align-items: center; gap: 10px;
+  padding: 8px 10px; border-radius: 8px;
+  background: var(--card2); border: 1px solid var(--border);
+}
+.zone-color-dot { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
+.zone-item-name { flex: 1; font-size: 0.75rem; color: var(--text); }
+.zone-item-pct { font-family: var(--mono); font-size: 0.7rem; color: var(--cyan); }
+
+/* ── GAZE HEATMAP ── */
+.heatmap-wrap {
+  background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 14px;
+}
+#gazeCanvas {
+  width: 100%; border-radius: 8px; display: block;
+  border: 1px solid var(--border2);
+  background: #0a0e12;
+}
+.gaze-legend {
+  display: flex; gap: 10px; margin-top: 8px; flex-wrap: wrap;
+}
+.gaze-legend-item { display: flex; align-items: center; gap: 5px; font-size: 0.6rem; color: var(--muted); }
+.gaze-color { width: 10px; height: 10px; border-radius: 2px; }
+
+/* ── VISITOR TIMELINE ── */
+.visitor-list { display: flex; flex-direction: column; gap: 6px; }
+.visitor-item {
+  background: var(--card); border: 1px solid var(--border);
+  border-radius: 8px; padding: 10px 12px;
+  display: flex; align-items: center; gap: 10px;
+  transition: border-color 0.3s;
+  animation: slideIn 0.3s ease;
+}
+.visitor-item.active { border-color: var(--cyan); }
+@keyframes slideIn { from{opacity:0;transform:translateX(-8px)} to{opacity:1;transform:translateX(0)} }
+.visitor-avatar {
+  width: 34px; height: 34px; border-radius: 8px; flex-shrink: 0;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 1rem;
+  background: var(--card2); border: 1px solid var(--border2);
+}
+.visitor-info { flex: 1; min-width: 0; }
+.visitor-id { font-family: var(--mono); font-size: 0.65rem; color: var(--cyan); }
+.visitor-status { font-size: 0.68rem; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.visitor-time {
+  font-family: var(--mono); font-size: 0.65rem;
+  padding: 3px 8px; border-radius: 4px;
+  background: var(--card2); border: 1px solid var(--border);
+  color: var(--green); white-space: nowrap; flex-shrink: 0;
+}
+
+/* ── ATTENTION BAR ── */
+.attention-zones { display: flex; flex-direction: column; gap: 6px; }
+.attention-row {
+  display: flex; align-items: center; gap: 10px;
+}
+.attention-label { font-size: 0.68rem; color: var(--text); min-width: 90px; }
+.attention-track {
+  flex: 1; height: 8px; background: var(--card2);
+  border-radius: 4px; overflow: hidden; border: 1px solid var(--border);
+}
+.attention-fill {
+  height: 100%; border-radius: 4px;
+  transition: width 1s ease;
+}
+.attention-pct { font-family: var(--mono); font-size: 0.6rem; color: var(--muted); min-width: 32px; text-align: right; }
+
+/* ── ANALYTICS CARDS ── */
+.analytics-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.analytics-card {
+  background: var(--card); border: 1px solid var(--border);
+  border-radius: 10px; padding: 14px;
+}
+.analytics-val {
+  font-family: var(--mono); font-size: 1.5rem; font-weight: 700;
+  color: var(--text); line-height: 1;
+}
+.analytics-val.cyan   { color: var(--cyan); }
+.analytics-val.orange { color: var(--orange); }
+.analytics-val.green  { color: var(--green); }
+.analytics-val.purple { color: var(--purple); }
+.analytics-label { font-size: 0.58rem; color: var(--muted); margin-top: 4px; text-transform: uppercase; letter-spacing: 0.5px; }
+.analytics-trend { font-size: 0.62rem; color: var(--green); margin-top: 6px; }
+
+/* ── LOG ── */
+.log-wrap {
+  background: var(--card); border: 1px solid var(--border);
+  border-radius: 10px; overflow: hidden;
+}
+.log-header {
+  padding: 9px 13px; border-bottom: 1px solid var(--border);
+  display: flex; justify-content: space-between; align-items: center;
+  font-family: var(--mono); font-size: 0.58rem; color: var(--muted); letter-spacing: 1px; text-transform: uppercase;
+}
+.log-body { max-height: 180px; overflow-y: auto; }
+.log-body::-webkit-scrollbar { width: 3px; }
+.log-body::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 2px; }
+.log-entry {
+  display: flex; align-items: flex-start; gap: 8px;
+  padding: 7px 13px; border-bottom: 1px solid rgba(35,45,56,0.5);
+  font-size: 0.68rem; line-height: 1.4;
+}
+.log-dot { width: 5px; height: 5px; border-radius: 50%; margin-top: 4px; flex-shrink: 0; }
+.log-msg { flex: 1; color: var(--text); }
+.log-time { font-family: var(--mono); font-size: 0.57rem; color: var(--muted); white-space: nowrap; }
+
+/* ── ALARM ── */
+#alarmOverlay {
+  display: none; position: fixed; inset: 0; z-index: 999;
+  background: rgba(255,71,87,0.12); backdrop-filter: blur(2px);
+  flex-direction: column; align-items: center; justify-content: center;
+  animation: flashbg 0.5s ease-in-out infinite;
+}
+#alarmOverlay.show { display: flex; }
+@keyframes flashbg { 0%,100%{opacity:1} 50%{opacity:0.7} }
+.alarm-card {
+  background: var(--surface); border: 2px solid var(--red);
+  border-radius: 16px; padding: 24px 28px;
+  text-align: center; max-width: 300px; width: 92%;
+  box-shadow: 0 0 40px rgba(255,71,87,0.3);
+}
+.alarm-title { font-family: var(--mono); font-size: 1.1rem; color: var(--red); font-weight: 700; margin-bottom: 6px; }
+.alarm-msg { font-size: 0.82rem; color: var(--muted); line-height: 1.5; margin-bottom: 18px; }
+.alarm-dismiss {
+  width: 100%; padding: 11px; background: var(--red);
+  color: #fff; border: none; border-radius: 8px;
+  font-size: 0.85rem; font-weight: 700; cursor: pointer;
+  font-family: var(--sans);
+}
+
+/* ── SETTINGS ── */
+.settings-section {
+  background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 14px;
+}
+.setting-row {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 8px 0; border-bottom: 1px solid rgba(35,45,56,0.6);
+}
+.setting-row:last-child { border-bottom: none; }
+.setting-label { font-size: 0.75rem; color: var(--text); }
+.setting-sub { font-size: 0.62rem; color: var(--muted); margin-top: 2px; }
+.setting-val {
+  font-family: var(--mono); font-size: 0.72rem; color: var(--cyan);
+  padding: 3px 8px; background: var(--card2); border: 1px solid var(--border2); border-radius: 4px;
+  min-width: 48px; text-align: center;
+}
+input[type=range] {
+  width: 100px; -webkit-appearance: none;
+  height: 4px; background: var(--border2); border-radius: 2px; outline: none;
+}
+input[type=range]::-webkit-slider-thumb {
+  -webkit-appearance: none; width: 14px; height: 14px;
+  border-radius: 50%; background: var(--cyan); cursor: pointer;
+  box-shadow: 0 0 6px rgba(0,212,255,0.5);
+}
+
+/* ── TOGGLE ── */
+.toggle { position: relative; display: inline-block; width: 40px; height: 22px; }
+.toggle input { opacity: 0; width: 0; height: 0; }
+.toggle-slider {
+  position: absolute; cursor: pointer; inset: 0;
+  background: var(--border2); border-radius: 11px; transition: 0.3s;
+}
+.toggle-slider:before {
+  position: absolute; content: '';
+  width: 16px; height: 16px; left: 3px; bottom: 3px;
+  background: var(--muted); border-radius: 50%; transition: 0.3s;
+}
+input:checked + .toggle-slider { background: rgba(0,212,255,0.3); border: 1px solid var(--cyan); }
+input:checked + .toggle-slider:before { transform: translateX(18px); background: var(--cyan); }
+
+/* ── BOTTOM ── */
+.bottom {
+  background: var(--surface); border-top: 1px solid var(--border);
+  padding: 8px 16px;
+  display: flex; justify-content: space-between; align-items: center;
+  font-family: var(--mono); font-size: 0.58rem; color: var(--muted);
+}
+</style>
 </head>
-<body class="p-4 md:p-6 max-w-7xl mx-auto">
+<body>
 
-    <header class="flex justify-between items-center mb-6">
+<!-- ALARM -->
+<div id="alarmOverlay">
+  <div class="alarm-card">
+    <div style="font-size:2.2rem;margin-bottom:8px">🚨</div>
+    <div class="alarm-title" id="alarmTitle">ALERTA DE MOVIMENTO</div>
+    <div class="alarm-msg" id="alarmMsg">Atividade detectada.</div>
+    <button class="alarm-dismiss" onclick="dismissAlarm()">✓ DISPENSAR</button>
+  </div>
+</div>
+
+<!-- HEADER -->
+<header>
+  <div class="logo">
+    <div class="logo-icon">👁️</div>
+    <div>
+      <div class="logo-name">RETAIL<span style="color:var(--orange)">EYE</span></div>
+      <div class="logo-sub">Análise Comportamental · Varejo</div>
+    </div>
+  </div>
+  <div class="header-right">
+    <div class="session-timer" id="sessionTimer">00:00:00</div>
+    <div class="live-badge" id="liveBadge">
+      <div class="live-dot"></div>
+      <span id="liveText">OFFLINE</span>
+    </div>
+  </div>
+</header>
+
+<!-- CAMERA BAR -->
+<div class="cam-bar">
+  <div class="cam-meta">
+    <span>FPS <b id="fpsEl">—</b></span>
+    <span>RES <b id="resEl">—</b></span>
+    <span>DETECT <b id="detectEl">0</b></span>
+    <span>ZONES <b id="zonesActive">0</b>/4</span>
+  </div>
+  <div class="cam-actions">
+    <button class="btn btn-ghost btn-sm" onclick="triggerBeep()">🔊</button>
+    <button class="btn btn-primary btn-sm" id="startBtn" onclick="startCamera()">▶ Iniciar</button>
+    <button class="btn btn-danger btn-sm" id="stopBtn" style="display:none" onclick="stopCamera()">■ Parar</button>
+  </div>
+</div>
+
+<!-- CAMERA -->
+<div class="cam-section" id="camSection">
+  <div class="cam-corner tl"></div>
+  <div class="cam-corner tr"></div>
+  <div class="cam-corner bl"></div>
+  <div class="cam-corner br"></div>
+  <div class="no-cam" id="noCam">
+    <div class="no-cam-icon">📹</div>
+    <p>Câmera offline<br>Toque em ▶ Iniciar para começar</p>
+  </div>
+  <video id="videoEl" autoplay muted playsinline></video>
+  <canvas id="overlayCanvas"></canvas>
+  <div class="scan-line" id="scanLine"></div>
+</div>
+
+<!-- TABS -->
+<div class="tabs">
+  <div class="tab active" onclick="switchTab('live')">🔴 Ao Vivo</div>
+  <div class="tab" onclick="switchTab('zones')">📍 Zonas</div>
+  <div class="tab" onclick="switchTab('gaze')">👁️ Atenção</div>
+  <div class="tab" onclick="switchTab('visitors')">👥 Visitantes</div>
+  <div class="tab" onclick="switchTab('analytics')">📊 Métricas</div>
+  <div class="tab" onclick="switchTab('config')">⚙️ Config</div>
+</div>
+
+<div class="body">
+
+  <!-- ── TAB: AO VIVO ── -->
+  <div class="panel active" id="panel-live">
+
+    <div class="hero-counter">
+      <div class="counter-row">
+        <div class="counter-big">
+          <div class="counter-num" id="peopleCount">0</div>
+          <div class="counter-label">pessoas<br>na loja</div>
+        </div>
+        <div class="counter-badge badge-low" id="occupancyBadge">VAZIO</div>
+      </div>
+      <div class="mini-stats">
+        <div class="mini-stat">
+          <div class="mini-stat-val cyan" id="totalToday">0</div>
+          <div class="mini-stat-label">Hoje</div>
+        </div>
+        <div class="mini-stat">
+          <div class="mini-stat-val orange" id="avgTime">0:00</div>
+          <div class="mini-stat-label">Tempo Méd.</div>
+        </div>
+        <div class="mini-stat">
+          <div class="mini-stat-val green" id="peakCount">0</div>
+          <div class="mini-stat-label">Pico</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="zones-grid">
+      <div class="zone-card" id="zoneA-card" style="--zone-color:#00d4ff">
+        <div class="zone-header">
+          <div class="zone-name">Zona A · Entrada</div>
+          <div class="zone-dot" id="zoneA-dot"></div>
+        </div>
+        <div class="zone-count" id="zoneA-count">0</div>
+        <div class="zone-time" id="zoneA-time">Tempo méd: —</div>
+      </div>
+      <div class="zone-card" id="zoneB-card" style="--zone-color:#ff7a2f">
+        <div class="zone-header">
+          <div class="zone-name">Zona B · Produtos</div>
+          <div class="zone-dot" id="zoneB-dot"></div>
+        </div>
+        <div class="zone-count" id="zoneB-count">0</div>
+        <div class="zone-time" id="zoneB-time">Tempo méd: —</div>
+      </div>
+      <div class="zone-card" id="zoneC-card" style="--zone-color:#2ecc8a">
+        <div class="zone-header">
+          <div class="zone-name">Zona C · Caixa</div>
+          <div class="zone-dot" id="zoneC-dot"></div>
+        </div>
+        <div class="zone-count" id="zoneC-count">0</div>
+        <div class="zone-time" id="zoneC-time">Tempo méd: —</div>
+      </div>
+      <div class="zone-card" id="zoneD-card" style="--zone-color:#a855f7">
+        <div class="zone-header">
+          <div class="zone-name">Zona D · Vitrine</div>
+          <div class="zone-dot" id="zoneD-dot"></div>
+        </div>
+        <div class="zone-count" id="zoneD-count">0</div>
+        <div class="zone-time" id="zoneD-time">Tempo méd: —</div>
+      </div>
+    </div>
+
+    <div class="log-wrap">
+      <div class="log-header">
+        <span>Log de Eventos</span>
+        <span id="logTotal" style="color:var(--cyan)">0 eventos</span>
+      </div>
+      <div class="log-body" id="logBody">
+        <div class="log-entry">
+          <div class="log-dot" style="background:var(--green)"></div>
+          <div class="log-msg">Sistema RetailEye pronto</div>
+          <div class="log-time">agora</div>
+        </div>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- ── TAB: ZONAS ── -->
+  <div class="panel" id="panel-zones">
+    <div class="section-title">Distribuição por Zona</div>
+
+    <div class="zone-setup">
+      <div class="section-title">Ocupação em Tempo Real</div>
+      <div class="attention-zones" id="zoneAttentionBars">
+        <div class="attention-row">
+          <div class="attention-label">🔵 Entrada</div>
+          <div class="attention-track"><div class="attention-fill" id="barA" style="width:0%;background:var(--cyan)"></div></div>
+          <div class="attention-pct" id="pctA">0%</div>
+        </div>
+        <div class="attention-row">
+          <div class="attention-label">🟠 Produtos</div>
+          <div class="attention-track"><div class="attention-fill" id="barB" style="width:0%;background:var(--orange)"></div></div>
+          <div class="attention-pct" id="pctB">0%</div>
+        </div>
+        <div class="attention-row">
+          <div class="attention-label">🟢 Caixa</div>
+          <div class="attention-track"><div class="attention-fill" id="barC" style="width:0%;background:var(--green)"></div></div>
+          <div class="attention-pct" id="pctC">0%</div>
+        </div>
+        <div class="attention-row">
+          <div class="attention-label">🟣 Vitrine</div>
+          <div class="attention-track"><div class="attention-fill" id="barD" style="width:0%;background:var(--purple)"></div></div>
+          <div class="attention-pct" id="pctD">0%</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="zone-setup">
+      <div class="section-title">Tempo Acumulado por Zona</div>
+      <div class="zone-list" id="zoneTimeList">
+        <div class="zone-item">
+          <div class="zone-color-dot" style="background:var(--cyan)"></div>
+          <div class="zone-item-name">Zona A · Entrada</div>
+          <div class="zone-item-pct" id="timeA">0s</div>
+        </div>
+        <div class="zone-item">
+          <div class="zone-color-dot" style="background:var(--orange)"></div>
+          <div class="zone-item-name">Zona B · Produtos</div>
+          <div class="zone-item-pct" id="timeB">0s</div>
+        </div>
+        <div class="zone-item">
+          <div class="zone-color-dot" style="background:var(--green)"></div>
+          <div class="zone-item-name">Zona C · Caixa</div>
+          <div class="zone-item-pct" id="timeC">0s</div>
+        </div>
+        <div class="zone-item">
+          <div class="zone-color-dot" style="background:var(--purple)"></div>
+          <div class="zone-item-name">Zona D · Vitrine</div>
+          <div class="zone-item-pct" id="timeD">0s</div>
+        </div>
+      </div>
+    </div>
+
+    <div style="background:var(--card);border:1px solid var(--border);border-radius:10px;padding:12px">
+      <div class="section-title">Zonas do Frame</div>
+      <p style="font-size:0.7rem;color:var(--muted);line-height:1.6">As zonas são mapeadas automaticamente no frame da câmera. O frame é dividido em 4 quadrantes: <b style="color:var(--cyan)">A·Entrada</b> (topo-esquerda), <b style="color:var(--orange)">B·Produtos</b> (topo-direita), <b style="color:var(--green)">C·Caixa</b> (baixo-esquerda), <b style="color:var(--purple)">D·Vitrine</b> (baixo-direita). Posicione a câmera para cobrir as áreas desejadas.</p>
+    </div>
+  </div>
+
+  <!-- ── TAB: ATENÇÃO ── -->
+  <div class="panel" id="panel-gaze">
+    <div class="heatmap-wrap">
+      <div class="section-title">Mapa de Calor de Atenção</div>
+      <canvas id="gazeCanvas" height="200"></canvas>
+      <div class="gaze-legend">
+        <div class="gaze-legend-item"><div class="gaze-color" style="background:#ff0000"></div>Alta atenção</div>
+        <div class="gaze-legend-item"><div class="gaze-color" style="background:#ff8800"></div>Média</div>
+        <div class="gaze-legend-item"><div class="gaze-color" style="background:#ffff00"></div>Baixa</div>
+        <div class="gaze-legend-item"><div class="gaze-color" style="background:#0044ff"></div>Sem atenção</div>
+      </div>
+    </div>
+
+    <div class="zone-setup">
+      <div class="section-title">Pontos de Interesse Detectados</div>
+      <div class="attention-zones" id="gazeZoneBars">
+        <div class="attention-row">
+          <div class="attention-label">Topo-Esquerda</div>
+          <div class="attention-track"><div class="attention-fill" id="gazeA" style="width:0%;background:#00d4ff"></div></div>
+          <div class="attention-pct" id="gazeApct">0%</div>
+        </div>
+        <div class="attention-row">
+          <div class="attention-label">Topo-Direita</div>
+          <div class="attention-track"><div class="attention-fill" id="gazeB" style="width:0%;background:#ff7a2f"></div></div>
+          <div class="attention-pct" id="gazeBpct">0%</div>
+        </div>
+        <div class="attention-row">
+          <div class="attention-label">Centro</div>
+          <div class="attention-track"><div class="attention-fill" id="gazeC" style="width:0%;background:#ffc542"></div></div>
+          <div class="attention-pct" id="gazeCpct">0%</div>
+        </div>
+        <div class="attention-row">
+          <div class="attention-label">Baixo-Direita</div>
+          <div class="attention-track"><div class="attention-fill" id="gazeD" style="width:0%;background:#a855f7"></div></div>
+          <div class="attention-pct" id="gazeDpct">0%</div>
+        </div>
+      </div>
+    </div>
+
+    <div style="background:var(--card);border:1px solid var(--border);border-radius:10px;padding:12px">
+      <div class="section-title">Como funciona</div>
+      <p style="font-size:0.7rem;color:var(--muted);line-height:1.6">O sistema analisa regiões de <b style="color:var(--text)">variação de brilho</b> no frame (movimento óptico). Áreas com mais variação temporal indicam onde há mais atividade de pessoas. O mapa de calor acumula esses dados ao longo do tempo para identificar os <b style="color:var(--cyan)">pontos de interesse</b> mais visitados da loja.</p>
+    </div>
+  </div>
+
+  <!-- ── TAB: VISITANTES ── -->
+  <div class="panel" id="panel-visitors">
+    <div class="section-title">Visitantes Detectados</div>
+    <div class="visitor-list" id="visitorList">
+      <div style="text-align:center;padding:20px;color:var(--muted);font-size:0.75rem">
+        Inicie a câmera para detectar visitantes
+      </div>
+    </div>
+  </div>
+
+  <!-- ── TAB: ANALYTICS ── -->
+  <div class="panel" id="panel-analytics">
+    <div class="section-title">Métricas da Sessão</div>
+    <div class="analytics-grid">
+      <div class="analytics-card">
+        <div class="analytics-val cyan" id="aTotalVisits">0</div>
+        <div class="analytics-label">Total de Visitas</div>
+        <div class="analytics-trend" id="aVisitTrend">—</div>
+      </div>
+      <div class="analytics-card">
+        <div class="analytics-val orange" id="aAvgDuration">0:00</div>
+        <div class="analytics-label">Duração Média</div>
+        <div class="analytics-trend" id="aDurationTrend">—</div>
+      </div>
+      <div class="analytics-card">
+        <div class="analytics-val green" id="aPeakOccupancy">0</div>
+        <div class="analytics-label">Pico de Ocupação</div>
+        <div class="analytics-trend" id="aPeakTime">—</div>
+      </div>
+      <div class="analytics-card">
+        <div class="analytics-val purple" id="aTopZone">—</div>
+        <div class="analytics-label">Zona mais visitada</div>
+        <div class="analytics-trend" id="aTopZoneTime">—</div>
+      </div>
+      <div class="analytics-card">
+        <div class="analytics-val cyan" id="aAlerts">0</div>
+        <div class="analytics-label">Alertas Gerados</div>
+      </div>
+      <div class="analytics-card">
+        <div class="analytics-val orange" id="aSessionTime">00:00</div>
+        <div class="analytics-label">Tempo de Sessão</div>
+      </div>
+    </div>
+
+    <div style="background:var(--card);border:1px solid var(--border);border-radius:10px;padding:12px;margin-top:4px">
+      <div class="section-title">Histórico de Ocupação (Sessão)</div>
+      <canvas id="historyCanvas" style="width:100%;height:80px;display:block;border-radius:6px"></canvas>
+    </div>
+
+    <button class="btn btn-ghost" style="width:100%;justify-content:center" onclick="exportData()">
+      📥 Exportar Dados CSV
+    </button>
+  </div>
+
+  <!-- ── TAB: CONFIG ── -->
+  <div class="panel" id="panel-config">
+    <div class="settings-section">
+      <div class="section-title">Detecção</div>
+      <div class="setting-row">
         <div>
-            <h1 class="text-3xl font-black italic tracking-tighter text-blue-500">RETAIL<span class="text-white">INTEL.2026</span></h1>
-            <p class="text-xs text-slate-500 uppercase tracking-widest">Painel de Controlo Operacional - Nível Executivo</p>
+          <div class="setting-label">Sensibilidade</div>
+          <div class="setting-sub">Limiar de detecção de movimento</div>
         </div>
-        <div class="hidden md:block">
-            <span class="flex items-center gap-2 text-emerald-400 text-xs font-bold bg-emerald-950/30 px-4 py-1 rounded-full border border-emerald-900">
-                <span class="h-2 w-2 rounded-full bg-emerald-500 animate-pulse"></span>
-                SISTEMA EM SINCRONIZAÇÃO
-            </span>
+        <div style="display:flex;align-items:center;gap:8px">
+          <input type="range" min="1" max="10" value="5" id="sensiSlider" oninput="updateSensi(this.value)">
+          <div class="setting-val" id="sensiVal">5</div>
         </div>
-    </header>
-
-    <main class="grid grid-cols-1 lg:grid-cols-12 gap-6">
-        
-        <!-- Área Central: Visão e Detecção -->
-        <div class="lg:col-span-8 space-y-6">
-            <div class="glass-card p-2 rounded-2xl">
-                <video id="webcam" class="w-full aspect-video bg-black rounded-xl object-cover shadow-2xl" autoplay playsinline></video>
-                <div class="p-4 flex gap-4">
-                    <button id="btnInit" class="flex-1 bg-blue-600 py-3 rounded-lg font-bold text-sm hover:bg-blue-500 transition shadow-lg">ATIVAR CÂMARA TRAS.</button>
-                    <button class="bg-slate-800 px-4 py-3 rounded-lg text-xs font-bold text-slate-400">CALIBRAR ZONAS</button>
-                </div>
-            </div>
-
-            <!-- Dashboard de Indicadores Expandido -->
-            <div class="stat-grid">
-                <div class="glass-card p-4 rounded-xl border-l-4 border-blue-500">
-                    <p class="text-[9px] text-slate-400 uppercase">Fluxo Clientes</p>
-                    <p class="text-2xl font-black">1.248</p>
-                </div>
-                <div class="glass-card p-4 rounded-xl border-l-4 border-emerald-500">
-                    <p class="text-[9px] text-slate-400 uppercase">Taxa Conversão</p>
-                    <p class="text-2xl font-black text-emerald-400">42.8%</p>
-                </div>
-                <div class="glass-card p-4 rounded-xl border-l-4 border-amber-500">
-                    <p class="text-[9px] text-slate-400 uppercase">Dwell Time Médio</p>
-                    <p class="text-2xl font-black">142s</p>
-                </div>
-                <div class="glass-card p-4 rounded-xl border-l-4 border-purple-500">
-                    <p class="text-[9px] text-slate-400 uppercase">Ticket Médio</p>
-                    <p class="text-2xl font-black">89,50 €</p>
-                </div>
-            </div>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Alarme de Aglomeração</div>
+          <div class="setting-sub">Alerta quando superar N pessoas</div>
         </div>
-
-        <!-- Sidebar Analítica -->
-        <div class="lg:col-span-4 space-y-6">
-            <div class="glass-card p-6 rounded-2xl h-full scroll-custom">
-                <h3 class="text-xs font-bold text-slate-400 uppercase mb-4">Relatório Detalhado (Tempo Real)</h3>
-                <div class="space-y-4">
-                    <!-- Progress bars -->
-                    <div>
-                        <div class="flex justify-between text-[10px] mb-1"><span>INTENÇÃO COMPRA</span><span class="text-blue-400">78%</span></div>
-                        <div class="w-full bg-slate-900 h-1.5 rounded-full"><div class="bg-blue-600 h-1.5 w-[78%] rounded-full"></div></div>
-                    </div>
-                    <div>
-                        <div class="flex justify-between text-[10px] mb-1"><span>EFICIÊNCIA ZONAL</span><span class="text-emerald-400">92%</span></div>
-                        <div class="w-full bg-slate-900 h-1.5 rounded-full"><div class="bg-emerald-600 h-1.5 w-[92%] rounded-full"></div></div>
-                    </div>
-                    <div>
-                        <div class="flex justify-between text-[10px] mb-1"><span>PRODUTIVIDADE</span><span class="text-purple-400">64%</span></div>
-                        <div class="w-full bg-slate-900 h-1.5 rounded-full"><div class="bg-purple-600 h-1.5 w-[64%] rounded-full"></div></div>
-                    </div>
-                </div>
-
-                <div class="mt-8">
-                    <h3 class="text-[10px] font-bold text-slate-500 uppercase mb-3">Logs de Eventos Cognitivos</h3>
-                    <div id="logs" class="text-[9px] font-mono text-slate-500 space-y-2 h-40 overflow-y-auto">
-                        <p class="text-blue-400">>> Sistema RetailIntel 2026 em operação.</p>
-                        <p>> Rastreio de movimento ativo.</p>
-                        <p>> Calibração automática concluída.</p>
-                    </div>
-                </div>
-            </div>
+        <div style="display:flex;align-items:center;gap:8px">
+          <input type="range" min="1" max="20" value="5" id="crowdSlider" oninput="updateCrowd(this.value)">
+          <div class="setting-val" id="crowdVal">5</div>
         </div>
-    </main>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Tempo mínimo de visita</div>
+          <div class="setting-sub">Ignorar detecções abaixo deste tempo</div>
+        </div>
+        <div style="display:flex;align-items:center;gap:8px">
+          <input type="range" min="1" max="30" value="3" id="minTimeSlider" oninput="updateMinTime(this.value)">
+          <div class="setting-val" id="minTimeVal">3s</div>
+        </div>
+      </div>
+    </div>
 
-    <script>
-        const video = document.getElementById('webcam');
-        const btnInit = document.getElementById('btnInit');
-        const logs = document.getElementById('logs');
+    <div class="settings-section">
+      <div class="section-title">Alertas</div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Alerta sonoro</div>
+          <div class="setting-sub">Beep ao detectar pessoas</div>
+        </div>
+        <label class="toggle"><input type="checkbox" id="soundToggle" checked><span class="toggle-slider"></span></label>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Alerta de aglomeração</div>
+          <div class="setting-sub">Aviso visual quando lotado</div>
+        </div>
+        <label class="toggle"><input type="checkbox" id="crowdAlertToggle" checked><span class="toggle-slider"></span></label>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Manter tela ligada</div>
+          <div class="setting-sub">Wake Lock durante monitoramento</div>
+        </div>
+        <label class="toggle"><input type="checkbox" id="wakeLockToggle" checked><span class="toggle-slider"></span></label>
+      </div>
+    </div>
 
-        function addLog(msg) {
-            const p = document.createElement('p');
-            p.textContent = `> ${new Date().toLocaleTimeString()} - ${msg}`;
-            logs.prepend(p);
-        }
+    <div class="settings-section">
+      <div class="section-title">Zonas Personalizadas</div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Zona A · Nome</div>
+        </div>
+        <input type="text" id="zoneAName" value="Entrada" style="background:var(--card2);border:1px solid var(--border2);color:var(--text);padding:4px 8px;border-radius:4px;font-size:0.72rem;width:100px">
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Zona B · Nome</div>
+        </div>
+        <input type="text" id="zoneBName" value="Produtos" style="background:var(--card2);border:1px solid var(--border2);color:var(--text);padding:4px 8px;border-radius:4px;font-size:0.72rem;width:100px">
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Zona C · Nome</div>
+        </div>
+        <input type="text" id="zoneCName" value="Caixa" style="background:var(--card2);border:1px solid var(--border2);color:var(--text);padding:4px 8px;border-radius:4px;font-size:0.72rem;width:100px">
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Zona D · Nome</div>
+        </div>
+        <input type="text" id="zoneDName" value="Vitrine" style="background:var(--card2);border:1px solid var(--border2);color:var(--text);padding:4px 8px;border-radius:4px;font-size:0.72rem;width:100px">
+      </div>
+      <button class="btn btn-primary" style="width:100%;justify-content:center;margin-top:10px" onclick="applyZoneNames()">Aplicar Nomes</button>
+    </div>
 
-        btnInit.addEventListener('click', async () => {
-            try {
-                const stream = await navigator.mediaDevices.getUserMedia({ 
-                    video: { facingMode: { exact: "environment" } } 
-                });
-                video.srcObject = stream;
-                btnInit.classList.add('hidden');
-                addLog("Câmara traseira conectada com sucesso.");
-            } catch (e) {
-                addLog("Erro de hardware: Câmara não detectada.");
-            }
-        });
-    </script>
+    <button class="btn btn-danger" style="width:100%;justify-content:center" onclick="resetSession()">🗑 Resetar Sessão</button>
+  </div>
+
+</div><!-- /body -->
+
+<div class="bottom">
+  <span>RetailEye v1.0 · Motion Analysis · Canvas API</span>
+  <span style="color:var(--muted);font-size:0.55rem;text-align:right">by <b style="color:var(--cyan)">Sandro de Souza Fagundes</b> · © 2026</span>
+</div>
+
+<script>
+// ══════════════════════════════════════════
+//  STATE
+// ══════════════════════════════════════════
+let stream = null, isRunning = false;
+let startTime = null;
+let fpsTracker = { frames: 0, last: Date.now() };
+
+// Settings
+let sensitivity = 5;
+let crowdLimit  = 5;
+let minVisitTime = 3;
+let alertSoundOn = true;
+let crowdAlertOn = true;
+
+// Session data
+let totalVisits = 0;
+let peakOccupancy = 0;
+let peakTime = null;
+let alertCount = 0;
+let visitDurations = [];
+let occupancyHistory = [];
+let historyInterval = null;
+
+// Zones
+const ZONES = {
+  A: { name: 'Entrada', color: '#00d4ff', count: 0, totalTime: 0, seconds: 0 },
+  B: { name: 'Produtos', color: '#ff7a2f', count: 0, totalTime: 0, seconds: 0 },
+  C: { name: 'Caixa',   color: '#2ecc8a', count: 0, totalTime: 0, seconds: 0 },
+  D: { name: 'Vitrine', color: '#a855f7', count: 0, totalTime: 0, seconds: 0 },
+};
+
+// Motion engine
+const MO = {
+  prevFrame: null,
+  currPeople: 0,
+  motionGrid: new Array(16).fill(0), // 4x4 grid
+  gazeHeat: new Array(20 * 15).fill(0), // 20x15 heatmap
+  worker: null,
+  capCanvas: null,
+  capCtx: null,
+  W: 60, H: 45,
+};
+MO.capCanvas = document.createElement('canvas');
+MO.capCanvas.width = MO.W; MO.capCanvas.height = MO.H;
+MO.capCtx = MO.capCanvas.getContext('2d', { willReadFrequently: true });
+
+// Visitors
+let visitors = [];
+let visitorIdCounter = 0;
+
+// DOM
+const video = document.getElementById('videoEl');
+const overlayCanvas = document.getElementById('overlayCanvas');
+const octx = overlayCanvas.getContext('2d');
+
+// ══════════════════════════════════════════
+//  TABS
+// ══════════════════════════════════════════
+function switchTab(name) {
+  document.querySelectorAll('.tab').forEach((t,i) => t.classList.remove('active'));
+  document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+  const tabs = document.querySelectorAll('.tab');
+  const panels = document.querySelectorAll('.panel');
+  const names = ['live','zones','gaze','visitors','analytics','config'];
+  const idx = names.indexOf(name);
+  if (idx >= 0) { tabs[idx].classList.add('active'); panels[idx].classList.add('active'); }
+}
+
+// ══════════════════════════════════════════
+//  CAMERA
+// ══════════════════════════════════════════
+async function startCamera() {
+  try {
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } },
+        audio: false
+      });
+    } catch(e) {
+      stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+    }
+    video.srcObject = stream;
+    video.style.display = 'block';
+    document.getElementById('noCam').style.display = 'none';
+    document.getElementById('startBtn').style.display = 'none';
+    document.getElementById('stopBtn').style.display = 'flex';
+    document.getElementById('scanLine').style.display = 'block';
+    document.getElementById('liveBadge').className = 'live-badge on';
+    document.getElementById('liveText').textContent = 'AO VIVO';
+    isRunning = true;
+    startTime = Date.now();
+    video.onloadedmetadata = () => {
+      overlayCanvas.width  = video.videoWidth;
+      overlayCanvas.height = video.videoHeight;
+      document.getElementById('resEl').textContent = video.videoWidth + '×' + video.videoHeight;
+      initGazeCanvas();
+    };
+    trackFPS();
+    MO.worker = setInterval(analyzeFrame, 200);
+    setInterval(updateSessionTimer, 1000);
+    setInterval(updateZoneTimes, 1000);
+    historyInterval = setInterval(recordHistory, 10000);
+    if (document.getElementById('wakeLockToggle').checked) requestWakeLock();
+    addLog('Câmera iniciada · Análise ativa', 'g');
+  } catch(e) {
+    addLog('Erro câmera: ' + e.message, 'r');
+    alert('Câmera indisponível:\n' + e.message);
+  }
+}
+
+function stopCamera() {
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  stream = null; isRunning = false;
+  clearInterval(MO.worker); MO.worker = null;
+  clearInterval(historyInterval);
+  video.style.display = 'none'; video.srcObject = null;
+  document.getElementById('noCam').style.display = 'flex';
+  document.getElementById('startBtn').style.display = 'flex';
+  document.getElementById('stopBtn').style.display = 'none';
+  document.getElementById('scanLine').style.display = 'none';
+  document.getElementById('liveBadge').className = 'live-badge';
+  document.getElementById('liveText').textContent = 'OFFLINE';
+  releaseWakeLock();
+  // Close all active visitors
+  visitors.filter(v => v.active).forEach(v => closeVisitor(v));
+  addLog('Câmera encerrada', 'y');
+}
+
+function trackFPS() {
+  if (!isRunning) return;
+  fpsTracker.frames++;
+  const now = Date.now();
+  if (now - fpsTracker.last >= 1000) {
+    document.getElementById('fpsEl').textContent = fpsTracker.frames;
+    fpsTracker.frames = 0; fpsTracker.last = now;
+  }
+  requestAnimationFrame(trackFPS);
+}
+
+// ══════════════════════════════════════════
+//  MOTION + ZONE ANALYSIS
+// ══════════════════════════════════════════
+const GRID_COLS = 4, GRID_ROWS = 4;
+const HMAP_COLS = 20, HMAP_ROWS = 15;
+let heatDecay = 0;
+
+function analyzeFrame() {
+  if (!isRunning || !video.videoWidth) return;
+
+  MO.capCtx.drawImage(video, 0, 0, MO.W, MO.H);
+  const curr = MO.capCtx.getImageData(0, 0, MO.W, MO.H).data;
+
+  if (!MO.prevFrame) { MO.prevFrame = curr.slice(); return; }
+
+  const thresh = (11 - sensitivity) * 2.5;
+
+  // Reset grid
+  const grid = new Array(GRID_COLS * GRID_ROWS).fill(0);
+  const hmap = new Array(HMAP_COLS * HMAP_ROWS).fill(0);
+  const gw = MO.W / HMAP_COLS, gh = MO.H / HMAP_ROWS;
+
+  let totalMotion = 0;
+
+  for (let py = 0; py < MO.H; py++) {
+    for (let px = 0; px < MO.W; px++) {
+      const idx = (py * MO.W + px) * 4;
+      const dr = Math.abs(curr[idx]   - MO.prevFrame[idx]);
+      const dg = Math.abs(curr[idx+1] - MO.prevFrame[idx+1]);
+      const db = Math.abs(curr[idx+2] - MO.prevFrame[idx+2]);
+      const diff = (dr + dg + db) / 3;
+      if (diff > thresh) {
+        // Grid cell
+        const gc = Math.floor((px / MO.W) * GRID_COLS);
+        const gr = Math.floor((py / MO.H) * GRID_ROWS);
+        grid[gr * GRID_COLS + gc]++;
+        // Heatmap cell
+        const hc = Math.floor(px / gw);
+        const hr = Math.floor(py / gh);
+        const hIdx = hr * HMAP_COLS + hc;
+        if (hIdx < hmap.length) hmap[hIdx] += diff;
+        totalMotion += diff;
+      }
+    }
+  }
+
+  MO.prevFrame = curr.slice();
+
+  // Update gaze heatmap (accumulate + decay)
+  for (let i = 0; i < MO.gazeHeat.length; i++) {
+    MO.gazeHeat[i] = MO.gazeHeat[i] * 0.97 + hmap[i] * 0.3;
+  }
+
+  // Count active zones (threshold: >8% of cells in zone active)
+  const cellsPerZone = (MO.W / GRID_COLS * MO.H / GRID_ROWS);
+  const motionThreshCell = thresh * 2;
+
+  // Each zone = one 2x2 block of the 4x4 grid
+  // A=top-left, B=top-right, C=bottom-left, D=bottom-right
+  const zoneMotion = {
+    A: grid[0]+grid[1]+grid[4]+grid[5],
+    B: grid[2]+grid[3]+grid[6]+grid[7],
+    C: grid[8]+grid[9]+grid[12]+grid[13],
+    D: grid[10]+grid[11]+grid[14]+grid[15],
+  };
+
+  // Estimate people count from total motion (rough heuristic)
+  const activeCells = grid.filter(v => v > motionThreshCell).length;
+  let estimatedPeople = Math.min(20, Math.floor(activeCells / 1.5));
+  MO.currPeople = estimatedPeople;
+
+  // Update zone active state
+  let zonesActiveCount = 0;
+  Object.entries(zoneMotion).forEach(([key, val]) => {
+    const isActive = val > motionThreshCell * 2;
+    if (isActive) zonesActiveCount++;
+    updateZoneActive(key, isActive, val);
+  });
+  document.getElementById('zonesActive').textContent = zonesActiveCount;
+
+  // Update gaze attention bars from heatmap quadrants
+  const totalHeat = MO.gazeHeat.reduce((a,b) => a+b, 0) || 1;
+  const quadrantHeat = [0,0,0,0]; // TL, TR, C, BR
+  MO.gazeHeat.forEach((v, i) => {
+    const col = i % HMAP_COLS, row = Math.floor(i / HMAP_COLS);
+    const isLeft = col < HMAP_COLS/2, isTop = row < HMAP_ROWS/2;
+    const isCenter = col >= HMAP_COLS*0.35 && col < HMAP_COLS*0.65 && row >= HMAP_ROWS*0.35 && row < HMAP_ROWS*0.65;
+    if (isCenter) quadrantHeat[2] += v;
+    else if (isTop && isLeft) quadrantHeat[0] += v;
+    else if (isTop && !isLeft) quadrantHeat[1] += v;
+    else quadrantHeat[3] += v;
+  });
+  const qTotal = quadrantHeat.reduce((a,b) => a+b, 0) || 1;
+  const gids = ['gazeA','gazeB','gazeC','gazeD'];
+  const gpids = ['gazeApct','gazeBpct','gazeCpct','gazeDpct'];
+  quadrantHeat.forEach((v,i) => {
+    const pct = Math.round((v/qTotal)*100);
+    document.getElementById(gids[i]).style.width = pct + '%';
+    document.getElementById(gpids[i]).textContent = pct + '%';
+  });
+
+  // Update UI
+  updatePeopleUI(estimatedPeople);
+  drawOverlay(grid, zoneMotion);
+  renderGazeHeatmap();
+  renderHistoryChart();
+
+  // Manage visitors
+  manageVisitors(estimatedPeople, zoneMotion, motionThreshCell);
+}
+
+// ══════════════════════════════════════════
+//  ZONES
+// ══════════════════════════════════════════
+const zoneActiveTimers = { A: 0, B: 0, C: 0, D: 0 };
+
+function updateZoneActive(key, isActive, motionVal) {
+  const z = ZONES[key];
+  const card = document.getElementById('zone'+key+'-card');
+  const dot  = document.getElementById('zone'+key+'-dot');
+
+  if (isActive) {
+    zoneActiveTimers[key] = (zoneActiveTimers[key] || 0) + 1;
+    card.classList.add('active-zone');
+    dot.classList.add('active');
+  } else {
+    zoneActiveTimers[key] = Math.max(0, (zoneActiveTimers[key] || 0) - 1);
+    if (zoneActiveTimers[key] === 0) {
+      card.classList.remove('active-zone');
+      dot.classList.remove('active');
+    }
+  }
+}
+
+function updateZoneTimes() {
+  if (!isRunning) return;
+
+  let totalSec = 0;
+  ['A','B','C','D'].forEach(k => {
+    if (document.getElementById('zone'+k+'-dot').classList.contains('active')) {
+      ZONES[k].seconds++;
+    }
+    totalSec += ZONES[k].seconds;
+  });
+
+  ['A','B','C','D'].forEach((k,i) => {
+    const s = ZONES[k].seconds;
+    document.getElementById('zone'+k+'-count').textContent =
+      zoneActiveTimers[k] > 0 ? '1+' : '0';
+    document.getElementById('zone'+k+'-time').textContent =
+      'Acum: ' + fmtSec(s);
+    document.getElementById('time'+k).textContent = fmtSec(s);
+  });
+
+  // Zone bars (relative distribution)
+  const total = ['A','B','C','D'].reduce((a,k) => a + ZONES[k].seconds, 0) || 1;
+  ['A','B','C','D'].forEach(k => {
+    const pct = Math.round((ZONES[k].seconds / total) * 100);
+    document.getElementById('bar'+k).style.width = pct + '%';
+    document.getElementById('pct'+k).textContent = pct + '%';
+  });
+
+  // Top zone
+  const top = ['A','B','C','D'].reduce((best, k) =>
+    ZONES[k].seconds > ZONES[best].seconds ? k : best, 'A');
+  document.getElementById('aTopZone').textContent = 'Zona ' + top;
+  document.getElementById('aTopZoneTime').textContent = fmtSec(ZONES[top].seconds);
+}
+
+// ══════════════════════════════════════════
+//  PEOPLE UI
+// ══════════════════════════════════════════
+function updatePeopleUI(count) {
+  document.getElementById('peopleCount').textContent = count;
+  document.getElementById('detectEl').textContent = count;
+
+  // Peak
+  if (count > peakOccupancy) {
+    peakOccupancy = count;
+    peakTime = new Date().toLocaleTimeString('pt-BR');
+    document.getElementById('peakCount').textContent = peakOccupancy;
+    document.getElementById('aPeakOccupancy').textContent = peakOccupancy;
+    document.getElementById('aPeakTime').textContent = 'às ' + peakTime;
+  }
+
+  // Occupancy badge
+  const badge = document.getElementById('occupancyBadge');
+  if (count === 0) {
+    badge.textContent = 'VAZIO'; badge.className = 'counter-badge badge-low';
+  } else if (count < Math.floor(crowdLimit * 0.5)) {
+    badge.textContent = 'BAIXO'; badge.className = 'counter-badge badge-low';
+  } else if (count < crowdLimit) {
+    badge.textContent = 'MÉDIO'; badge.className = 'counter-badge badge-med';
+  } else {
+    badge.textContent = 'LOTADO'; badge.className = 'counter-badge badge-high';
+    if (crowdAlertOn) {
+      const lastAlert = window._lastCrowdAlert || 0;
+      if (Date.now() - lastAlert > 30000) {
+        window._lastCrowdAlert = Date.now();
+        fireAlarm('🏪 LOJA LOTADA', `${count} pessoas detectadas. Limite: ${crowdLimit}.`);
+      }
+    }
+  }
+}
+
+// ══════════════════════════════════════════
+//  VISITOR TRACKING
+// ══════════════════════════════════════════
+function manageVisitors(count, zoneMotion, thresh) {
+  const activeCount = visitors.filter(v => v.active).length;
+
+  if (count > activeCount) {
+    // New visitor
+    for (let i = 0; i < count - activeCount; i++) {
+      const id = ++visitorIdCounter;
+      const topZone = Object.entries(zoneMotion).sort((a,b)=>b[1]-a[1])[0][0];
+      const v = {
+        id, active: true, startTime: Date.now(),
+        zone: topZone, pathZones: [topZone],
+        duration: 0,
+      };
+      visitors.push(v);
+      totalVisits++;
+      document.getElementById('totalToday').textContent = totalVisits;
+      document.getElementById('aTotalVisits').textContent = totalVisits;
+      addLog(`👤 Visitante #${id} entrou · Zona ${topZone}`, 'g');
+      if (alertSoundOn) triggerBeep();
+      updateVisitorList();
+    }
+  } else if (count < activeCount) {
+    // Visitor left
+    const active = visitors.filter(v => v.active);
+    for (let i = 0; i < activeCount - count; i++) {
+      if (active[i]) closeVisitor(active[i]);
+    }
+  }
+
+  // Update zones for active visitors
+  const topZone = Object.entries(zoneMotion).sort((a,b)=>b[1]-a[1])[0][0];
+  visitors.filter(v => v.active).forEach(v => {
+    v.duration = Math.floor((Date.now() - v.startTime) / 1000);
+    if (zoneMotion[topZone] > thresh && !v.pathZones.includes(topZone)) {
+      v.pathZones.push(topZone);
+      v.zone = topZone;
+    }
+  });
+
+  updateVisitorList();
+  updateAvgTime();
+}
+
+function closeVisitor(v) {
+  v.active = false;
+  v.duration = Math.floor((Date.now() - v.startTime) / 1000);
+  if (v.duration >= minVisitTime) {
+    visitDurations.push(v.duration);
+    addLog(`👤 Visitante #${v.id} saiu · ${fmtSec(v.duration)} · Zonas: ${v.pathZones.join('→')}`, 'y');
+  }
+  updateAvgTime();
+  updateVisitorList();
+}
+
+function updateAvgTime() {
+  if (visitDurations.length === 0) return;
+  const avg = Math.floor(visitDurations.reduce((a,b)=>a+b,0) / visitDurations.length);
+  const fmt = fmtSec(avg);
+  document.getElementById('avgTime').textContent = fmt;
+  document.getElementById('aAvgDuration').textContent = fmt;
+}
+
+function updateVisitorList() {
+  const el = document.getElementById('visitorList');
+  const all = [...visitors].reverse().slice(0, 12);
+  if (all.length === 0) {
+    el.innerHTML = '<div style="text-align:center;padding:20px;color:var(--muted);font-size:0.75rem">Nenhum visitante detectado ainda</div>';
+    return;
+  }
+  el.innerHTML = all.map(v => `
+    <div class="visitor-item ${v.active ? 'active' : ''}">
+      <div class="visitor-avatar">${v.active ? '🚶' : '✓'}</div>
+      <div class="visitor-info">
+        <div class="visitor-id">VIS-${String(v.id).padStart(3,'0')}</div>
+        <div class="visitor-status">${v.active ? '🔴 Na loja · Zona '+v.zone : '✅ Saiu · '+v.pathZones.join('→')}</div>
+      </div>
+      <div class="visitor-time">${fmtSec(v.duration)}</div>
+    </div>
+  `).join('');
+}
+
+// ══════════════════════════════════════════
+//  OVERLAY DRAWING
+// ══════════════════════════════════════════
+function drawOverlay(grid, zoneMotion) {
+  if (!isRunning || !overlayCanvas.width) return;
+  const W = overlayCanvas.width, H = overlayCanvas.height;
+  octx.clearRect(0, 0, W, H);
+
+  // Draw zone borders
+  const zoneColors = ['#00d4ff','#ff7a2f','#2ecc8a','#a855f7'];
+  const zoneKeys   = ['A','B','C','D'];
+  const zoneCoords = [
+    [0, 0, W/2, H/2],
+    [W/2, 0, W/2, H/2],
+    [0, H/2, W/2, H/2],
+    [W/2, H/2, W/2, H/2],
+  ];
+
+  zoneCoords.forEach(([x, y, w, h], i) => {
+    const key = zoneKeys[i];
+    const isActive = document.getElementById('zone'+key+'-dot').classList.contains('active');
+    octx.strokeStyle = zoneColors[i] + (isActive ? 'ff' : '55');
+    octx.lineWidth = isActive ? 2 : 1;
+    octx.setLineDash(isActive ? [] : [6,4]);
+    octx.strokeRect(x+2, y+2, w-4, h-4);
+    octx.setLineDash([]);
+
+    // Zone label
+    octx.fillStyle = zoneColors[i] + (isActive ? 'ff' : '88');
+    octx.font = `bold 11px 'Space Mono', monospace`;
+    octx.fillText(`${key}·${ZONES[key].name}`, x+8, y+18);
+
+    // Fill if active
+    if (isActive) {
+      octx.fillStyle = zoneColors[i] + '15';
+      octx.fillRect(x+2, y+2, w-4, h-4);
+    }
+
+    // Motion cells within zone
+    const gc = i % 2 * 2, gr = Math.floor(i / 2) * 2;
+    const cellW = W/4, cellH = H/4;
+    [[0,0],[1,0],[0,1],[1,1]].forEach(([dc,dr]) => {
+      const gIdx = (gr+dr)*GRID_COLS + (gc+dc);
+      const val = grid[gIdx] || 0;
+      if (val > 0) {
+        const cx = (gc+dc)*cellW, cy = (gr+dr)*cellH;
+        const intensity = Math.min(1, val/20);
+        octx.fillStyle = zoneColors[i] + Math.floor(intensity*80).toString(16).padStart(2,'0');
+        octx.fillRect(cx, cy, cellW, cellH);
+      }
+    });
+  });
+
+  // People count badge
+  if (MO.currPeople > 0) {
+    octx.fillStyle = 'rgba(0,212,255,0.9)';
+    octx.font = `bold 14px 'Space Mono'`;
+    const badge = `${MO.currPeople} pessoa${MO.currPeople>1?'s':''}`;
+    const bw = octx.measureText(badge).width + 20;
+    octx.beginPath();
+    octx.roundRect(W/2 - bw/2, 8, bw, 28, 6);
+    octx.fillStyle = 'rgba(0,0,0,0.7)';
+    octx.fill();
+    octx.strokeStyle = '#00d4ff';
+    octx.lineWidth = 1;
+    octx.stroke();
+    octx.fillStyle = '#00d4ff';
+    octx.textAlign = 'center';
+    octx.fillText(badge, W/2, 26);
+    octx.textAlign = 'left';
+  }
+}
+
+// ══════════════════════════════════════════
+//  GAZE HEATMAP
+// ══════════════════════════════════════════
+let gazeCanvas, gctx;
+function initGazeCanvas() {
+  gazeCanvas = document.getElementById('gazeCanvas');
+  gctx = gazeCanvas.getContext('2d');
+}
+
+function renderGazeHeatmap() {
+  if (!gazeCanvas || !gctx) return;
+  const GW = gazeCanvas.width  = gazeCanvas.parentElement.clientWidth - 28;
+  const GH = gazeCanvas.height = 200;
+  const cellW = GW / HMAP_COLS, cellH = GH / HMAP_ROWS;
+
+  gctx.clearRect(0, 0, GW, GH);
+  gctx.fillStyle = '#0a0e12';
+  gctx.fillRect(0, 0, GW, GH);
+
+  const maxHeat = Math.max(...MO.gazeHeat, 1);
+
+  MO.gazeHeat.forEach((v, i) => {
+    const col = i % HMAP_COLS, row = Math.floor(i / HMAP_COLS);
+    const intensity = v / maxHeat;
+    if (intensity < 0.01) return;
+
+    const r = Math.floor(intensity * 255);
+    const g = Math.floor((1 - intensity) * intensity * 4 * 255);
+    const b = Math.floor((1 - intensity) * 255 * 0.3);
+    gctx.fillStyle = `rgba(${r},${g},${b},${Math.min(0.85, intensity * 1.5)})`;
+
+    const x = col * cellW, y = row * cellH;
+    gctx.fillRect(x, y, cellW+1, cellH+1);
+  });
+
+  // Zone grid
+  gctx.strokeStyle = 'rgba(255,255,255,0.08)';
+  gctx.lineWidth = 1;
+  gctx.setLineDash([4,4]);
+  gctx.beginPath();
+  gctx.moveTo(GW/2, 0); gctx.lineTo(GW/2, GH);
+  gctx.moveTo(0, GH/2); gctx.lineTo(GW, GH/2);
+  gctx.stroke();
+  gctx.setLineDash([]);
+
+  // Labels
+  const labels = [['A·Entrada','#00d4ff'], ['B·Produtos','#ff7a2f'], ['C·Caixa','#2ecc8a'], ['D·Vitrine','#a855f7']];
+  [[6, 14],[GW/2+6, 14],[6, GH/2+14],[GW/2+6, GH/2+14]].forEach(([x,y],i) => {
+    gctx.font = "9px 'Space Mono'";
+    gctx.fillStyle = labels[i][1] + 'aa';
+    gctx.fillText(labels[i][0], x, y);
+  });
+}
+
+// ══════════════════════════════════════════
+//  HISTORY CHART
+// ══════════════════════════════════════════
+function recordHistory() {
+  if (!isRunning) return;
+  occupancyHistory.push(MO.currPeople);
+  if (occupancyHistory.length > 30) occupancyHistory.shift();
+  renderHistoryChart();
+}
+
+function renderHistoryChart() {
+  const hc = document.getElementById('historyCanvas');
+  if (!hc) return;
+  const W = hc.width = hc.parentElement.clientWidth - 28;
+  const H = hc.height = 80;
+  const ctx = hc.getContext('2d');
+  ctx.clearRect(0, 0, W, H);
+  ctx.fillStyle = '#0a0e12';
+  ctx.fillRect(0, 0, W, H);
+
+  if (occupancyHistory.length < 2) return;
+
+  const maxVal = Math.max(...occupancyHistory, crowdLimit, 1);
+  const grad = ctx.createLinearGradient(0, 0, 0, H);
+  grad.addColorStop(0, 'rgba(0,212,255,0.4)');
+  grad.addColorStop(1, 'rgba(0,212,255,0)');
+
+  ctx.beginPath();
+  occupancyHistory.forEach((v, i) => {
+    const x = (i / (occupancyHistory.length - 1)) * W;
+    const y = H - (v / maxVal) * (H - 10) - 4;
+    i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+  });
+  ctx.lineTo(W, H); ctx.lineTo(0, H); ctx.closePath();
+  ctx.fillStyle = grad; ctx.fill();
+
+  ctx.strokeStyle = '#00d4ff'; ctx.lineWidth = 2;
+  ctx.beginPath();
+  occupancyHistory.forEach((v, i) => {
+    const x = (i / (occupancyHistory.length - 1)) * W;
+    const y = H - (v / maxVal) * (H - 10) - 4;
+    i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+  });
+  ctx.stroke();
+
+  // Crowd limit line
+  const limitY = H - (crowdLimit / maxVal) * (H - 10) - 4;
+  ctx.strokeStyle = '#ff475755'; ctx.lineWidth = 1;
+  ctx.setLineDash([4, 4]);
+  ctx.beginPath(); ctx.moveTo(0, limitY); ctx.lineTo(W, limitY); ctx.stroke();
+  ctx.setLineDash([]);
+}
+
+// ══════════════════════════════════════════
+//  TIMERS / SESSION
+// ══════════════════════════════════════════
+function updateSessionTimer() {
+  if (!startTime) return;
+  const s = Math.floor((Date.now() - startTime) / 1000);
+  const h = Math.floor(s/3600), m = Math.floor((s%3600)/60), sec = s%60;
+  const fmt = `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(sec).padStart(2,'0')}`;
+  document.getElementById('sessionTimer').textContent = fmt;
+  document.getElementById('aSessionTime').textContent = fmt.slice(3);
+}
+
+// ══════════════════════════════════════════
+//  ALARM
+// ══════════════════════════════════════════
+function fireAlarm(title, msg) {
+  document.getElementById('alarmTitle').textContent = title;
+  document.getElementById('alarmMsg').textContent = msg;
+  document.getElementById('alarmOverlay').className = 'show';
+  alertCount++;
+  document.getElementById('aAlerts').textContent = alertCount;
+  addLog('🚨 ' + msg, 'r');
+  if (alertSoundOn) { triggerBeep(); setTimeout(triggerBeep, 600); }
+}
+
+function dismissAlarm() {
+  document.getElementById('alarmOverlay').className = '';
+}
+
+function triggerBeep() {
+  try {
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.connect(gain); gain.connect(ctx.destination);
+    osc.type = 'sine'; osc.frequency.value = 880;
+    gain.gain.setValueAtTime(0, ctx.currentTime);
+    gain.gain.linearRampToValueAtTime(0.4, ctx.currentTime + 0.01);
+    gain.gain.setValueAtTime(0.4, ctx.currentTime + 0.1);
+    gain.gain.linearRampToValueAtTime(0, ctx.currentTime + 0.15);
+    osc.start(ctx.currentTime); osc.stop(ctx.currentTime + 0.2);
+    setTimeout(() => ctx.close(), 500);
+  } catch(e) {}
+}
+
+// ══════════════════════════════════════════
+//  SETTINGS
+// ══════════════════════════════════════════
+function updateSensi(v) { sensitivity = parseInt(v); document.getElementById('sensiVal').textContent = v; }
+function updateCrowd(v) { crowdLimit = parseInt(v); document.getElementById('crowdVal').textContent = v; }
+function updateMinTime(v) { minVisitTime = parseInt(v); document.getElementById('minTimeVal').textContent = v+'s'; }
+
+function applyZoneNames() {
+  ZONES.A.name = document.getElementById('zoneAName').value || 'Zona A';
+  ZONES.B.name = document.getElementById('zoneBName').value || 'Zona B';
+  ZONES.C.name = document.getElementById('zoneCName').value || 'Zona C';
+  ZONES.D.name = document.getElementById('zoneDName').value || 'Zona D';
+  addLog('Nomes de zonas atualizados', 'g');
+}
+
+function resetSession() {
+  if (!confirm('Resetar todos os dados da sessão?')) return;
+  totalVisits = 0; peakOccupancy = 0; peakTime = null; alertCount = 0;
+  visitDurations = []; occupancyHistory = []; visitors = []; visitorIdCounter = 0;
+  Object.keys(ZONES).forEach(k => { ZONES[k].count = 0; ZONES[k].seconds = 0; });
+  MO.gazeHeat.fill(0);
+  ['A','B','C','D'].forEach(k => { zoneActiveTimers[k] = 0; });
+  ['totalToday','peakCount','aAlerts','aTotalVisits'].forEach(id => {
+    const el = document.getElementById(id); if(el) el.textContent = '0';
+  });
+  addLog('Sessão resetada', 'y');
+}
+
+// ══════════════════════════════════════════
+//  EXPORT
+// ══════════════════════════════════════════
+function exportData() {
+  const rows = [
+    ['Métrica', 'Valor'],
+    ['Total de Visitas', totalVisits],
+    ['Pico de Ocupação', peakOccupancy],
+    ['Horário do Pico', peakTime || '—'],
+    ['Duração Média (s)', visitDurations.length ? Math.floor(visitDurations.reduce((a,b)=>a+b,0)/visitDurations.length) : 0],
+    ['Alertas Gerados', alertCount],
+    ['Zona A (s)', ZONES.A.seconds],
+    ['Zona B (s)', ZONES.B.seconds],
+    ['Zona C (s)', ZONES.C.seconds],
+    ['Zona D (s)', ZONES.D.seconds],
+    ...visitors.map(v => [`Visitante #${v.id}`, `${fmtSec(v.duration)} | ${v.pathZones.join('>')}`])
+  ];
+  const csv = rows.map(r => r.join(',')).join('\n');
+  const blob = new Blob([csv], { type: 'text/csv' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `RetailEye_${new Date().toISOString().slice(0,10)}.csv`;
+  a.click();
+  addLog('Dados exportados · CSV', 'g');
+}
+
+// ══════════════════════════════════════════
+//  WAKE LOCK
+// ══════════════════════════════════════════
+let wakeLock = null;
+async function requestWakeLock() {
+  try {
+    if ('wakeLock' in navigator) wakeLock = await navigator.wakeLock.request('screen');
+  } catch(e) {}
+}
+function releaseWakeLock() {
+  if (wakeLock) { wakeLock.release(); wakeLock = null; }
+}
+document.addEventListener('visibilitychange', async () => {
+  if (wakeLock !== null && document.visibilityState === 'visible' && isRunning) requestWakeLock();
+});
+
+// ══════════════════════════════════════════
+//  LOG
+// ══════════════════════════════════════════
+let logTotal = 0;
+function addLog(msg, type='g') {
+  logTotal++;
+  document.getElementById('logTotal').textContent = logTotal + ' eventos';
+  const body = document.getElementById('logBody');
+  const entry = document.createElement('div');
+  entry.className = 'log-entry';
+  const colors = { g: 'var(--green)', r: 'var(--red)', y: 'var(--yellow)', c: 'var(--cyan)' };
+  entry.innerHTML = `
+    <div class="log-dot" style="background:${colors[type]||colors.g}"></div>
+    <div class="log-msg">${msg}</div>
+    <div class="log-time">${new Date().toLocaleTimeString('pt-BR')}</div>
+  `;
+  body.insertBefore(entry, body.firstChild);
+  while (body.children.length > 15) body.removeChild(body.lastChild);
+}
+
+// ══════════════════════════════════════════
+//  HELPERS
+// ══════════════════════════════════════════
+function fmtSec(s) {
+  if (s < 60) return s + 's';
+  return `${Math.floor(s/60)}min ${s%60}s`;
+}
+
+// Init
+initGazeCanvas();
+</script>
 </body>
 </html>
-
-```
