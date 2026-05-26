@@ -996,49 +996,45 @@ const GRID_COLS = 4, GRID_ROWS = 4;
 const HMAP_COLS = 20, HMAP_ROWS = 15;
 
 // ── BACKGROUND MODEL ──
-// Aprende o fundo ao longo do tempo (Mixture of Gaussians simplificado).
-// TV, tapete, roupas no chão → mudam de forma CONTÍNUA → são absorvidas
-// como fundo com o tempo e param de gerar detecção.
+// Aprende apenas frames SEM pessoa (calibração inicial com câmera apontada ao ambiente).
+// Depois da calibração: pixels que diferem do fundo = foreground (pessoa).
+// TV: muda continuamente → gradualmente absorvida como fundo.
+// Pessoa parada: SIM deve ser detectada — não virar fundo rapidamente.
 const BG = {
   model: null,
   variance: null,
   frameCount: 0,
-  LEARN_RATE: 0.04,      // fundo estático: aprender moderado
-  LEARN_RATE_SLOW: 0.015,// foreground persistente (TV): absorver devagar mas absorver
-  LEARN_RATE_TV: 0.035,  // movimento periódico (TV piscando): absorver mais rápido
-  CALIB_FRAMES: 50,      // ~10s de calibração inicial (mais robusto)
+  LEARN_RATE: 0.02,      // fundo estático: aprender DEVAGAR (não absorve pessoa parada)
+  LEARN_RATE_FG: 0.005,  // foreground confirmado: aprender muito devagar
+  LEARN_RATE_TV: 0.03,   // pixel que oscila constantemente (TV): absorver mais rápido
+  CALIB_FRAMES: 40,      // ~8s de calibração — aponta para ambiente SEM pessoas
   calibrated: false,
-  // Buffer de variância temporal por pixel: detecta pixels que piscam
-  // periodicamente (TV) — eles têm variância ALTA e são suprimidos
-  tvSuppress: null,      // Float32Array: acumula variância histórica por pixel
+  tvSuppress: null,       // acumula pixels que oscilam periodicamente (TV)
 };
 
 // ── BLOB DETECTOR ──
-// Filtros para distinguir pessoa de objeto/TV/tapete:
-// 1. TAMANHO: blob de pessoa ocupa área razoável no frame
-// 2. PROPORÇÃO: silhueta humana tem altura > largura (vertical)
-// 3. DESLOCAMENTO: pessoa se move entre frames (TV permanece no mesmo lugar)
-// 4. DENSIDADE: TV/tapete gera blob muito denso e uniforme; pessoa é irregular
+// Estratégia: detectar qualquer região de movimento com tamanho compatível com pessoa.
+// Anti-falso-positivo: limitar MAX_AREA (evita TV grande) e MAX_ASPECT (evita TV widescreen).
+// Pessoa parada É válida — não exigir deslocamento.
 const BLOB = {
-  MIN_AREA: 25,          // maior → exige blob mais sólido (reduz TV/tapete)
-  MAX_AREA: 280,         // acima disso é ruído global
-  MIN_ASPECT: 0.2,       // largura/altura mínima
-  MAX_ASPECT: 2.2,       // largura/altura máxima — TV tende a ser muito larga
-  MIN_HEIGHT_CELLS: 2,   // blob deve ter pelo menos 2 células de altura (pessoa tem altura)
-  MAX_DENSITY: 0.85,     // blobs muito densos (>85% das células preenchidas) = TV/objeto, não pessoa
+  MIN_AREA: 8,           // permissivo — detecta pessoa mesmo parcialmente no frame
+  MAX_AREA: 350,         // TV grande pode gerar blob enorme — rejeitar
+  MIN_ASPECT: 0.1,       // aceita qualquer forma humana
+  MAX_ASPECT: 3.5,       // TV widescreen: aspecto muito alto → rejeitar
+  MIN_HEIGHT_CELLS: 1,
+  MAX_DENSITY: 0.99,     // praticamente desativado — não filtrar por densidade
   blobHistory: [],
-  // Rastrear posição de blobs entre frames para detectar deslocamento
   prevBlobs: [],
-  MIN_DISPLACEMENT: 0.3, // blob deve se deslocar ao menos 0.3 células entre frames
-                          // (TV fica parada; pessoa se move)
-  staleFrames: [],        // quantos frames cada blob ficou parado
-  MAX_STALE: 15,          // blob parado por >15 frames → provavelmente objeto estático
+  MIN_DISPLACEMENT: 0.0, // NÃO exigir deslocamento — pessoa parada é válida
+  staleFrames: {},
+  MAX_STALE: 999,        // nunca rejeitar blob por estar parado
 };
 
 // ── TEMPORAL BUFFER ──
+// Mediana de 5 frames = estável mas responsivo
 const TEMPORAL = {
   buffer: [],
-  WINDOW: 7,             // janela maior → mais estável, menos falso-positivo
+  WINDOW: 5,
   stable: 0,
 };
 
@@ -1087,38 +1083,41 @@ function analyzeFrame() {
   const gw = MO.W / HMAP_COLS, gh = MO.H / HMAP_ROWS;
 
   for (let i = 0; i < gray.length; i++) {
-    const diff = gray[i] - BG.model[i];
+    const diff  = gray[i] - BG.model[i];
     const sigma = Math.sqrt(BG.variance[i]);
-    const isFG = Math.abs(diff) > K * sigma;
+    const absDiff = Math.abs(diff);
+    const isFG  = absDiff > K * sigma;
 
     if (isFG) {
       fgMask[i] = 1;
       const px = i % MO.W, py = Math.floor(i / MO.W);
       const hc = Math.min(HMAP_COLS-1, Math.floor(px / gw));
       const hr = Math.min(HMAP_ROWS-1, Math.floor(py / gh));
-      hmap[hr * HMAP_COLS + hc] += Math.abs(diff);
+      hmap[hr * HMAP_COLS + hc] += absDiff;
     }
 
     // ── Atualizar modelo de fundo ──
-    // Pixels FG que se repetem muito (TV, tapete): absorver mais rápido com o tempo
-    // tvSuppress acumula quanto esse pixel costuma ser FG → se sempre FG = não é pessoa
-    BG.tvSuppress[i] += isFG ? 0.04 : -0.01;
+    // Pixels FG: aprender MUITO devagar (não absorver pessoa parada rapidamente)
+    // Pixels fundo: aprender devagar (estabilidade)
+    // tvSuppress: pixels que ficam alternando (TV piscando) acumulam score
+    // → quando score alto, aprender mais rápido (TV vira fundo)
+    BG.tvSuppress[i] += isFG ? 0.02 : -0.005;
     BG.tvSuppress[i]  = Math.max(0, Math.min(1, BG.tvSuppress[i]));
 
-    // Quanto mais "cronicamente ativo" o pixel, mais rápido vira fundo
-    const suppressBoost = BG.tvSuppress[i] * 0.04;
+    // Taxa de aprendizado: TV (oscila muito) → absorver; pessoa (entra e sai) → não absorver
+    const tvBoost = BG.tvSuppress[i] > 0.6 ? BG.LEARN_RATE_TV : 0;
     const lr = isFG
-      ? BG.LEARN_RATE_SLOW + suppressBoost  // FG: absorver devagar, mas mais rápido se TV
-      : BG.LEARN_RATE;                       // fundo: aprender normal
+      ? BG.LEARN_RATE_FG + tvBoost   // foreground: muito lento (não absorve pessoa)
+      : BG.LEARN_RATE;               // fundo: moderado
 
-    BG.model[i]    += lr * (gray[i] - BG.model[i]);
+    BG.model[i]    += lr * diff;
     const newVar    = (gray[i] - BG.model[i]) ** 2;
     BG.variance[i] += lr * (newVar - BG.variance[i]);
-    BG.variance[i]  = Math.max(BG.variance[i], 64);
+    BG.variance[i]  = Math.max(BG.variance[i], 36); // sigma_min = 6
 
-    // Pixel cronicamente ativo (tvSuppress alto): suprimir do foreground
-    // Isso elimina TV, tapete colorido, roupa no chão que ficam parados
-    if (BG.tvSuppress[i] > 0.75) fgMask[i] = 0;
+    // Suprimir APENAS pixels com score de TV muito alto (>0.85)
+    // Isso elimina TV mas NÃO elimina pessoa parada (score dela não sobe tão rápido)
+    if (BG.tvSuppress[i] > 0.85) fgMask[i] = 0;
   }
 
   // Atualizar heatmap de atenção
