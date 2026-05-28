@@ -5,6 +5,9 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
 <title>RetailEye — Análise de Comportamento em Loja</title>
 <link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=DM+Sans:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+<!-- TensorFlow.js + COCO-SSD (detecção de pessoas real) -->
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.17.0/dist/tf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3/dist/coco-ssd.min.js"></script>
 <style>
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
 
@@ -946,14 +949,14 @@ async function startCamera() {
       initGazeCanvas();
     };
     trackFPS();
-    BG.model = null;
-    MO.currBlobs = [];
-    MO.worker = setInterval(analyzeFrame, 200);
+    startDetection();
     setInterval(updateSessionTimer, 1000);
     setInterval(updateZoneTimes, 1000);
     historyInterval = setInterval(recordHistory, 10000);
     if (document.getElementById('wakeLockToggle').checked) requestWakeLock();
-    addLog('Câmera iniciada · Calibrando fundo (6s)...', 'g');
+    // Pré-carregar modelo assim que câmera abrir
+    if (!tfReady && !tfLoading) loadModel();
+    addLog('📹 Câmera iniciada', 'g');
   } catch(e) {
     addLog('Erro câmera: ' + e.message, 'r');
     alert('Câmera indisponível:\n' + e.message);
@@ -963,7 +966,7 @@ async function startCamera() {
 function stopCamera() {
   if (stream) stream.getTracks().forEach(t => t.stop());
   stream = null; isRunning = false;
-  clearInterval(MO.worker); MO.worker = null;
+  stopDetection();
   clearInterval(historyInterval);
   video.style.display = 'none'; video.srcObject = null;
   document.getElementById('noCam').style.display = 'flex';
@@ -973,8 +976,13 @@ function stopCamera() {
   document.getElementById('liveBadge').className = 'live-badge';
   document.getElementById('liveText').textContent = 'OFFLINE';
   releaseWakeLock();
-  // Close all active visitors
-  visitors.filter(v => v.active).forEach(v => closeVisitor(v));
+  // Fechar visitantes ativos do tracker
+  TRACKER.people.filter(p => p.active).forEach(p => {
+    p.active = false;
+    const dur = Math.floor((Date.now() - p.firstSeen) / 1000);
+    if (dur >= minVisitTime) visitDurations.push(dur);
+  });
+  updateAvgTime();
   addLog('Câmera encerrada', 'y');
 }
 
@@ -990,251 +998,369 @@ function trackFPS() {
 }
 
 // ══════════════════════════════════════════
-//  MOTION + ZONE ANALYSIS  (v2 — anti falso-positivo)
+//  DETECTION ENGINE v3 — TensorFlow.js COCO-SSD
+//  Detecta classe "person" com IA real.
+//  Não detecta TV, tapete, cachorro como pessoa.
 // ══════════════════════════════════════════
 const GRID_COLS = 4, GRID_ROWS = 4;
 const HMAP_COLS = 20, HMAP_ROWS = 15;
 
-// ── BACKGROUND MODEL ──
-// Modelo simples e robusto: média móvel exponencial por pixel.
-// Aprende o fundo devagar → pessoa aparece como foreground.
-// TV/luz: muda devagar → absorvida gradualmente como fundo.
-const BG = {
-  model: null,        // média do fundo (Float32Array)
-  frameCount: 0,
-  LEARN_RATE: 0.008,  // muito lento → pessoa parada leva ~2min para virar fundo
-  CALIB_FRAMES: 35,   // ~7s calibração
-  calibrated: false,
-  tvSuppress: null,
+let tfModel  = null;   // COCO-SSD model
+let tfReady  = false;
+let tfLoading = false;
+let detectLoop = null;
+
+// Tracker de pessoas por posição (persistência entre frames)
+const TRACKER = {
+  people: [],          // [{id, x, y, w, h, zone, firstSeen, lastSeen, pathZones}]
+  nextId: 1,
+  MAX_DIST: 0.25,      // distância normalizada máxima para considerar mesma pessoa
+  MAX_LOST: 15,        // frames sem detecção antes de remover
 };
 
-// ── BLOB ──
-// Filtros mínimos: só tamanho e proporção básica.
-// Qualquer objeto do tamanho de uma pessoa (criança incluída) é contado.
-const BLOB = {
-  MIN_AREA: 4,        // muito permissivo — criança sentada ocupa pouco espaço
-  MAX_AREA: 400,
-  MIN_ASPECT: 0.08,
-  MAX_ASPECT: 4.0,
-  MIN_HEIGHT_CELLS: 1,
-  MAX_DENSITY: 1.0,   // sem filtro de densidade
-  blobHistory: [],
-  prevBlobs: [],
-  staleFrames: {},
-  MAX_STALE: 999,
-};
+// Heatmap acumulado
+const gazeHeat = new Array(HMAP_COLS * HMAP_ROWS).fill(0);
+let currDetections = []; // últimas detecções brutas do modelo
 
-// ── TEMPORAL ──
-const TEMPORAL = {
-  buffer: [],
-  WINDOW: 4,          // janela menor = mais responsivo
-  stable: 0,
-};
-
-// Resolução maior para melhor detecção de blobs
-MO.W = 80; MO.H = 60;
-MO.capCanvas.width = MO.W; MO.capCanvas.height = MO.H;
-
-function initBGModel() {
-  const N = MO.W * MO.H;
-  BG.model      = new Float32Array(N).fill(128);
-  BG.tvSuppress = new Float32Array(N).fill(0);
-  BG.prevGray   = null;
-  BG.frameCount = 0;
-  BG.calibrated = false;
-  TEMPORAL.buffer = [];
-  TEMPORAL.stable = 0;
-  BLOB.blobHistory = [];
-  BLOB.prevBlobs   = [];
-  BLOB.staleFrames = {};
-  addLog('🔧 Calibrando — aponte para ambiente vazio por 7s', 'c');
+// ── Carregar modelo ──
+async function loadModel() {
+  if (tfReady || tfLoading) return;
+  tfLoading = true;
+  document.getElementById('detectEl').textContent = 'carregando IA...';
+  addLog('🧠 Carregando modelo COCO-SSD...', 'c');
+  try {
+    tfModel = await cocoSsd.load({ base: 'lite_mobilenet_v2' });
+    tfReady  = true;
+    tfLoading = false;
+    document.getElementById('detectEl').textContent = 'IA pronta';
+    addLog('✅ Modelo COCO-SSD carregado — detectando pessoas', 'g');
+  } catch(e) {
+    tfLoading = false;
+    addLog('❌ Falha ao carregar modelo: ' + e.message, 'r');
+    document.getElementById('detectEl').textContent = 'erro IA';
+  }
 }
 
-function analyzeFrame() {
-  if (!isRunning || !video.videoWidth) return;
+// ── Loop de detecção ──
+async function runDetection() {
+  if (!isRunning || !tfReady || !video.videoWidth) return;
 
-  MO.capCtx.drawImage(video, 0, 0, MO.W, MO.H);
-  const raw = MO.capCtx.getImageData(0, 0, MO.W, MO.H).data;
+  try {
+    // Detectar com COCO-SSD — retorna [{bbox:[x,y,w,h], class, score}]
+    const raw = await tfModel.detect(video, 6, 0.35); // max 6 obj, threshold 35%
 
-  // Escala de cinza
-  const gray = new Float32Array(MO.W * MO.H);
-  for (let i = 0; i < MO.W * MO.H; i++) {
-    gray[i] = 0.299 * raw[i*4] + 0.587 * raw[i*4+1] + 0.114 * raw[i*4+2];
+    // Filtrar apenas "person"
+    const persons = raw.filter(d => d.class === 'person' && d.score >= 0.38);
+    currDetections = persons;
+
+    // Normalizar coordenadas para 0-1
+    const vw = video.videoWidth, vh = video.videoHeight;
+    const normalized = persons.map(p => ({
+      x:  p.bbox[0] / vw,
+      y:  p.bbox[1] / vh,
+      w:  p.bbox[2] / vw,
+      h:  p.bbox[3] / vh,
+      cx: (p.bbox[0] + p.bbox[2]/2) / vw,
+      cy: (p.bbox[1] + p.bbox[3]/2) / vh,
+      score: p.score,
+      bbox: p.bbox,
+    }));
+
+    // Atualizar heatmap com centróides das pessoas
+    normalized.forEach(p => {
+      const hc = Math.min(HMAP_COLS-1, Math.floor(p.cx * HMAP_COLS));
+      const hr = Math.min(HMAP_ROWS-1, Math.floor(p.cy * HMAP_ROWS));
+      // Gaussiana simples ao redor do centróide
+      for (let dr = -2; dr <= 2; dr++) {
+        for (let dc = -2; dc <= 2; dc++) {
+          const nc = hc+dc, nr = hr+dr;
+          if (nc<0||nc>=HMAP_COLS||nr<0||nr>=HMAP_ROWS) continue;
+          const dist = Math.sqrt(dc*dc+dr*dr);
+          gazeHeat[nr*HMAP_COLS+nc] += Math.exp(-dist*0.8) * p.score;
+        }
+      }
+    });
+    // Decay do heatmap
+    for (let i = 0; i < gazeHeat.length; i++) gazeHeat[i] *= 0.992;
+
+    // Atualizar tracker de pessoas
+    updateTracker(normalized);
+
+    // Calcular zonas
+    const zoneMotion = { A:0, B:0, C:0, D:0 };
+    const zoneKeys   = ['A','B','C','D']; // TL, TR, BL, BR
+    normalized.forEach(p => {
+      const isLeft = p.cx < 0.5, isTop = p.cy < 0.5;
+      if (isTop  && isLeft)  { zoneMotion.A++; }
+      else if (isTop  && !isLeft) { zoneMotion.B++; }
+      else if (!isTop && isLeft)  { zoneMotion.C++; }
+      else                        { zoneMotion.D++; }
+    });
+
+    let zonesActive = 0;
+    Object.entries(zoneMotion).forEach(([k,v]) => {
+      const active = v > 0;
+      if (active) zonesActive++;
+      updateZoneActive(k, active, v);
+    });
+    document.getElementById('zonesActive').textContent = zonesActive;
+
+    // Atenção por quadrante do heatmap
+    const qHeat = [0,0,0,0];
+    gazeHeat.forEach((v,i) => {
+      const col = i % HMAP_COLS, row = Math.floor(i/HMAP_COLS);
+      const isLeft = col < HMAP_COLS/2, isTop = row < HMAP_ROWS/2;
+      if      (isTop  && isLeft)  qHeat[0] += v;
+      else if (isTop  && !isLeft) qHeat[1] += v;
+      else if (!isTop && isLeft)  qHeat[2] += v;
+      else                        qHeat[3] += v;
+    });
+    const qTotal = qHeat.reduce((a,b)=>a+b,0)||1;
+    ['gazeA','gazeB','gazeC','gazeD'].forEach((id,i) => {
+      const pct = Math.round((qHeat[i]/qTotal)*100);
+      document.getElementById(id).style.width = pct+'%';
+      document.getElementById(id+'pct').textContent = pct+'%';
+    });
+
+    const count = normalized.length;
+    document.getElementById('detectEl').textContent = count;
+    updatePeopleUI(count);
+    drawOverlayTF(normalized, zoneMotion);
+    renderGazeHeatmap();
+    renderHistoryChart();
+    manageVisitors(count, zoneMotion, 0);
+
+  } catch(e) {
+    // Ignorar erros isolados de frame
   }
+}
 
-  // Inicializar na 1ª chamada
-  if (!BG.model) { initBGModel(); BG.model.set(gray); BG.prevGray = gray.slice(); return; }
+// ── Tracker: associar detecções a pessoas conhecidas ──
+function updateTracker(detections) {
+  const now = Date.now();
 
-  BG.frameCount++;
+  // Marcar todas como "não vistas neste frame"
+  TRACKER.people.forEach(p => p.seenThisFrame = false);
 
-  // ── CALIBRAÇÃO ──
-  if (BG.frameCount <= BG.CALIB_FRAMES) {
-    for (let i = 0; i < gray.length; i++) {
-      BG.model[i] += 0.2 * (gray[i] - BG.model[i]);
+  detections.forEach(det => {
+    // Encontrar pessoa mais próxima no tracker
+    let best = null, bestDist = TRACKER.MAX_DIST;
+    TRACKER.people.forEach(p => {
+      if (!p.active) return;
+      const d = Math.sqrt((p.cx - det.cx)**2 + (p.cy - det.cy)**2);
+      if (d < bestDist) { bestDist = d; best = p; }
+    });
+
+    if (best) {
+      // Atualizar pessoa existente
+      best.cx = det.cx; best.cy = det.cy;
+      best.x = det.x; best.y = det.y;
+      best.w = det.w; best.h = det.h;
+      best.lastSeen = now;
+      best.seenThisFrame = true;
+      best.lostFrames = 0;
+
+      // Atualizar zona
+      const zone = getZoneForPoint(det.cx, det.cy);
+      if (zone !== best.zone) {
+        if (!best.pathZones.includes(zone)) best.pathZones.push(zone);
+        best.zone = zone;
+      }
+    } else {
+      // Nova pessoa
+      const zone = getZoneForPoint(det.cx, det.cy);
+      const id = TRACKER.nextId++;
+      TRACKER.people.push({
+        id, cx: det.cx, cy: det.cy,
+        x: det.x, y: det.y, w: det.w, h: det.h,
+        zone, pathZones: [zone],
+        firstSeen: now, lastSeen: now,
+        active: true, seenThisFrame: true, lostFrames: 0,
+      });
+      totalVisits++;
+      document.getElementById('totalToday').textContent = totalVisits;
+      document.getElementById('aTotalVisits').textContent = totalVisits;
+      addLog(`👤 Pessoa #${id} detectada · Zona ${zone}`, 'g');
+      if (alertSoundOn) triggerBeep();
+      updateVisitorListFromTracker();
     }
-    const pct = Math.round((BG.frameCount / BG.CALIB_FRAMES) * 100);
-    document.getElementById('detectEl').textContent = `cal ${pct}%`;
-    updatePeopleUI(0);
-    drawOverlay(new Array(GRID_COLS * GRID_ROWS).fill(0), {A:0,B:0,C:0,D:0}, []);
-    if (BG.frameCount === BG.CALIB_FRAMES) {
-      BG.calibrated = true;
-      addLog('✅ Calibrado! Detectando pessoas...', 'g');
-    }
-    BG.prevGray = gray.slice();
-    return;
-  }
+  });
 
-  // ── DETECÇÃO DUAL: frame-diff + background subtraction ──
-  // frame-diff: detecta QUALQUER movimento (pessoa parada por <3s aparece)
-  // bg-subtract: detecta objetos que diferem do fundo aprendido
-  // UNION dos dois → máxima sensibilidade
-  const threshBG   = Math.max(8, 28 - sensitivity * 2);   // bg subtraction threshold
-  const threshDiff = Math.max(6, 20 - sensitivity * 1.5); // frame diff threshold
-
-  const fgMask = new Uint8Array(MO.W * MO.H);
-  const hmap   = new Array(HMAP_COLS * HMAP_ROWS).fill(0);
-  const gw = MO.W / HMAP_COLS, gh = MO.H / HMAP_ROWS;
-
-  for (let i = 0; i < gray.length; i++) {
-    const bgDiff   = Math.abs(gray[i] - BG.model[i]);
-    const frameDiff = BG.prevGray ? Math.abs(gray[i] - BG.prevGray[i]) : 0;
-
-    // FG se diferir do fundo OU se houver movimento em relação ao frame anterior
-    const isFG = bgDiff > threshBG || frameDiff > threshDiff;
-
-    if (isFG) {
-      fgMask[i] = 1;
-      const px = i % MO.W, py = Math.floor(i / MO.W);
-      const hc = Math.min(HMAP_COLS-1, Math.floor(px / gw));
-      const hr = Math.min(HMAP_ROWS-1, Math.floor(py / gh));
-      hmap[hr * HMAP_COLS + hc] += Math.max(bgDiff, frameDiff);
-    }
-
-    // Atualizar modelo de fundo: muito devagar para foreground, moderado para fundo
-    const lr = isFG ? 0.003 : 0.008;
-    BG.model[i] += lr * (gray[i] - BG.model[i]);
-  }
-
-  // Salvar frame atual para próxima iteração
-  BG.prevGray = gray.slice();
-
-  // Atualizar heatmap
-  for (let i = 0; i < MO.gazeHeat.length; i++) {
-    MO.gazeHeat[i] = MO.gazeHeat[i] * 0.97 + hmap[i] * 0.3;
-  }
-
-  // ── DILATAÇÃO: unir pixels próximos em blobs coesos ──
-  const dilated = new Uint8Array(MO.W * MO.H);
-  for (let py = 1; py < MO.H-1; py++) {
-    for (let px = 1; px < MO.W-1; px++) {
-      const i = py * MO.W + px;
-      if (fgMask[i] || fgMask[i-1] || fgMask[i+1] || fgMask[i-MO.W] || fgMask[i+MO.W]) {
-        dilated[i] = 1;
+  // Incrementar lostFrames para quem não foi visto
+  TRACKER.people.forEach(p => {
+    if (!p.seenThisFrame && p.active) {
+      p.lostFrames = (p.lostFrames||0) + 1;
+      if (p.lostFrames > TRACKER.MAX_LOST) {
+        p.active = false;
+        const dur = Math.floor((p.lastSeen - p.firstSeen) / 1000);
+        if (dur >= minVisitTime) {
+          visitDurations.push(dur);
+          addLog(`👤 Pessoa #${p.id} saiu · ${fmtSec(dur)} · ${p.pathZones.join('→')}`, 'y');
+          updateAvgTime();
+        }
+        updateVisitorListFromTracker();
       }
     }
-  }
-
-  // ── GRID 4x4 ──
-  const cellW = MO.W / GRID_COLS, cellH = MO.H / GRID_ROWS;
-  const grid  = new Array(GRID_COLS * GRID_ROWS).fill(0);
-  for (let i = 0; i < dilated.length; i++) {
-    if (!dilated[i]) continue;
-    const px = i % MO.W, py = Math.floor(i / MO.W);
-    const gc = Math.min(GRID_COLS-1, Math.floor(px / cellW));
-    const gr = Math.min(GRID_ROWS-1, Math.floor(py / cellH));
-    grid[gr * GRID_COLS + gc]++;
-  }
-
-  // ── BLOBS (BFS) ──
-  const CELL_MIN = 1;
-  const visited = new Array(GRID_COLS * GRID_ROWS).fill(false);
-  const blobs   = [];
-
-  for (let start = 0; start < grid.length; start++) {
-    if (visited[start] || grid[start] < CELL_MIN) continue;
-    const queue = [start];
-    visited[start] = true;
-    let area = 0, minC = GRID_COLS, maxC = 0, minR = GRID_ROWS, maxR = 0;
-
-    while (queue.length) {
-      const cur = queue.shift();
-      const cc  = cur % GRID_COLS, cr = Math.floor(cur / GRID_COLS);
-      area += grid[cur];
-      minC = Math.min(minC, cc); maxC = Math.max(maxC, cc);
-      minR = Math.min(minR, cr); maxR = Math.max(maxR, cr);
-
-      [[0,1],[0,-1],[1,0],[-1,0]].forEach(([dc,dr]) => {
-        const nc = cc+dc, nr = cr+dr;
-        if (nc < 0 || nc >= GRID_COLS || nr < 0 || nr >= GRID_ROWS) return;
-        const ni = nr * GRID_COLS + nc;
-        if (visited[ni] || grid[ni] < CELL_MIN) return;
-        visited[ni] = true;
-        queue.push(ni);
-      });
-    }
-
-    const blobW  = maxC - minC + 1;
-    const blobH  = maxR - minR + 1;
-    const aspect = blobH === 0 ? 99 : blobW / blobH;
-    const cx = (minC + maxC) / 2, cy = (minR + maxR) / 2;
-
-    // Filtros mínimos: só rejeitar ruído minúsculo (area<3) ou frame inteiro (area>500)
-    if (area >= 3 && area <= 500 && aspect <= 5.0) {
-      blobs.push({ area, minC, maxC, minR, maxR, cx, cy });
-    }
-  }
-
-  // ── ESTABILIZAÇÃO: mediana de 4 frames ──
-  TEMPORAL.buffer.push(blobs.length);
-  if (TEMPORAL.buffer.length > TEMPORAL.WINDOW) TEMPORAL.buffer.shift();
-  const sorted = [...TEMPORAL.buffer].sort((a,b) => a-b);
-  TEMPORAL.stable = sorted[Math.floor(sorted.length / 2)];
-
-  MO.currPeople = TEMPORAL.stable;
-  MO.currBlobs  = blobs;
-
-  // ── ZONAS: quadrantes do grid 4x4 ──
-  const ZONE_THRESH = 2;
-  const zoneMotion = {
-    A: grid[0]+grid[1]+grid[4]+grid[5],
-    B: grid[2]+grid[3]+grid[6]+grid[7],
-    C: grid[8]+grid[9]+grid[12]+grid[13],
-    D: grid[10]+grid[11]+grid[14]+grid[15],
-  };
-
-  let zonesActiveCount = 0;
-  Object.entries(zoneMotion).forEach(([key, val]) => {
-    const isActive = val >= ZONE_THRESH;
-    if (isActive) zonesActiveCount++;
-    updateZoneActive(key, isActive, val);
-  });
-  document.getElementById('zonesActive').textContent = zonesActiveCount;
-
-  // Atenção por quadrante
-  const quadrantHeat = [0,0,0,0];
-  MO.gazeHeat.forEach((v, i) => {
-    const col = i % HMAP_COLS, row = Math.floor(i / HMAP_COLS);
-    const isLeft = col < HMAP_COLS/2, isTop = row < HMAP_ROWS/2;
-    const isCenter = col >= HMAP_COLS*0.35 && col < HMAP_COLS*0.65 &&
-                     row >= HMAP_ROWS*0.35 && row < HMAP_ROWS*0.65;
-    if (isCenter)          quadrantHeat[2] += v;
-    else if (isTop && isLeft)  quadrantHeat[0] += v;
-    else if (isTop && !isLeft) quadrantHeat[1] += v;
-    else                   quadrantHeat[3] += v;
-  });
-  const qTotal = quadrantHeat.reduce((a,b) => a+b, 0) || 1;
-  ['gazeA','gazeB','gazeC','gazeD'].forEach((id,i) => {
-    const pct = Math.round((quadrantHeat[i]/qTotal)*100);
-    document.getElementById(id).style.width = pct + '%';
-    document.getElementById(id+'pct').textContent = pct + '%';
   });
 
-  updatePeopleUI(TEMPORAL.stable);
-  drawOverlay(grid, zoneMotion, blobs);
-  renderGazeHeatmap();
-  renderHistoryChart();
-  manageVisitors(TEMPORAL.stable, zoneMotion, ZONE_THRESH);
+  // Limpar pessoas muito antigas inativas
+  if (TRACKER.people.length > 50) {
+    TRACKER.people.splice(0, TRACKER.people.length - 50);
+  }
 }
+
+function getZoneForPoint(cx, cy) {
+  if (cy < 0.5 && cx < 0.5) return 'A';
+  if (cy < 0.5 && cx >= 0.5) return 'B';
+  if (cy >= 0.5 && cx < 0.5) return 'C';
+  return 'D';
+}
+
+function updateVisitorListFromTracker() {
+  const el = document.getElementById('visitorList');
+  const all = [...TRACKER.people].reverse().slice(0, 12);
+  if (all.length === 0) {
+    el.innerHTML = '<div style="text-align:center;padding:20px;color:var(--muted);font-size:0.75rem">Nenhuma pessoa detectada ainda</div>';
+    return;
+  }
+  el.innerHTML = all.map(p => {
+    const dur = p.active
+      ? Math.floor((Date.now() - p.firstSeen) / 1000)
+      : Math.floor((p.lastSeen - p.firstSeen) / 1000);
+    return `
+      <div class="visitor-item ${p.active ? 'active' : ''}">
+        <div class="visitor-avatar">${p.active ? '🚶' : '✓'}</div>
+        <div class="visitor-info">
+          <div class="visitor-id">PES-${String(p.id).padStart(3,'0')}</div>
+          <div class="visitor-status">${p.active ? '🔴 Na loja · Zona '+p.zone : '✅ Saiu · '+p.pathZones.join('→')}</div>
+        </div>
+        <div class="visitor-time">${fmtSec(dur)}</div>
+      </div>`;
+  }).join('');
+}
+
+// ── Overlay com bounding boxes reais do modelo ──
+function drawOverlayTF(persons, zoneMotion) {
+  if (!isRunning || !overlayCanvas.width) return;
+  const W = overlayCanvas.width, H = overlayCanvas.height;
+  octx.clearRect(0, 0, W, H);
+
+  // Zonas
+  const zoneColors = ['#00d4ff','#ff7a2f','#2ecc8a','#a855f7'];
+  const zoneKeys   = ['A','B','C','D'];
+  const zoneCoords = [[0,0,W/2,H/2],[W/2,0,W/2,H/2],[0,H/2,W/2,H/2],[W/2,H/2,W/2,H/2]];
+
+  zoneCoords.forEach(([x,y,w,h],i) => {
+    const key = zoneKeys[i];
+    const isActive = zoneMotion[key] > 0;
+    octx.fillStyle = zoneColors[i] + (isActive ? '14' : '06');
+    octx.fillRect(x, y, w, h);
+    octx.strokeStyle = zoneColors[i] + (isActive ? 'cc' : '38');
+    octx.lineWidth = isActive ? 2 : 1;
+    octx.setLineDash(isActive ? [] : [8,5]);
+    octx.strokeRect(x+1, y+1, w-2, h-2);
+    octx.setLineDash([]);
+    octx.font = "bold 11px 'Space Mono', monospace";
+    const label = `${key} · ${ZONES[key].name}`;
+    const lw = octx.measureText(label).width + 12;
+    octx.fillStyle = 'rgba(0,0,0,0.7)';
+    octx.fillRect(x+6, y+6, lw, 18);
+    octx.fillStyle = zoneColors[i] + (isActive ? 'ff' : '99');
+    octx.fillText(label, x+12, y+19);
+  });
+
+  // Linhas divisórias
+  octx.strokeStyle = 'rgba(255,255,255,0.1)';
+  octx.lineWidth = 1; octx.setLineDash([4,4]);
+  octx.beginPath();
+  octx.moveTo(W/2,0); octx.lineTo(W/2,H);
+  octx.moveTo(0,H/2); octx.lineTo(W,H/2);
+  octx.stroke(); octx.setLineDash([]);
+
+  // Bounding boxes das pessoas — coordenadas reais do modelo
+  const vw = video.videoWidth, vh = video.videoHeight;
+  const scaleX = W / vw, scaleY = H / vh;
+
+  persons.forEach((p, idx) => {
+    const bx = p.x * W, by = p.y * H;
+    const bw = p.w * W, bh = p.h * H;
+    const conf = Math.round(p.score * 100);
+    const zone = getZoneForPoint(p.cx, p.cy);
+    const zColor = zoneColors[zoneKeys.indexOf(zone)] || '#2ecc8a';
+
+    // Sombra + borda
+    octx.shadowBlur = 16; octx.shadowColor = zColor;
+    octx.strokeStyle = zColor;
+    octx.lineWidth = 2.5;
+    octx.strokeRect(bx, by, bw, bh);
+    octx.shadowBlur = 0;
+
+    // Fill semi-transparente
+    octx.fillStyle = zColor + '18';
+    octx.fillRect(bx, by, bw, bh);
+
+    // Canto superior — label com ID e confiança
+    const lbl = `P${idx+1}  ${conf}%`;
+    octx.font = "bold 10px 'Space Mono', monospace";
+    const lblW = octx.measureText(lbl).width + 10;
+    octx.fillStyle = 'rgba(0,0,0,0.85)';
+    octx.fillRect(bx, by - 18, lblW, 18);
+    octx.fillStyle = zColor;
+    octx.fillText(lbl, bx+5, by-5);
+
+    // Ponto central (centróide)
+    octx.beginPath();
+    octx.arc(p.cx*W, p.cy*H, 4, 0, Math.PI*2);
+    octx.fillStyle = zColor;
+    octx.fill();
+  });
+
+  // Badge contador
+  const count = persons.length;
+  const badge = tfReady
+    ? (count > 0 ? `${count} pessoa${count>1?'s':''}` : 'Nenhuma pessoa')
+    : '🧠 Carregando IA...';
+  octx.font = "bold 12px 'Space Mono'";
+  const bw2 = octx.measureText(badge).width + 22;
+  octx.fillStyle = 'rgba(0,0,0,0.78)';
+  octx.beginPath();
+  if (octx.roundRect) octx.roundRect(W/2-bw2/2, 8, bw2, 26, 6);
+  else octx.rect(W/2-bw2/2, 8, bw2, 26);
+  octx.fill();
+  octx.strokeStyle = count > 0 ? '#2ecc8a' : '#00d4ff';
+  octx.lineWidth = 1.5; octx.stroke();
+  octx.fillStyle = count > 0 ? '#2ecc8a' : '#00d4ff';
+  octx.textAlign = 'center';
+  octx.fillText(badge, W/2, 25);
+  octx.textAlign = 'left';
+}
+
+// Manter compatibilidade com chamadas antigas de drawOverlay
+function drawOverlay(grid, zoneMotion, blobs) {
+  drawOverlayTF([], zoneMotion || {A:0,B:0,C:0,D:0});
+}
+
+// ── Iniciar/parar detecção ──
+async function startDetection() {
+  stopDetection();
+  if (!tfReady) {
+    await loadModel();
+  }
+  if (!tfReady) {
+    addLog('❌ Modelo IA não carregou — verifique conexão', 'r');
+    return;
+  }
+  if (detectLoop) clearInterval(detectLoop);
+  detectLoop = setInterval(runDetection, 350); // ~3fps — equilíbrio performance/bateria
+  addLog('👁️ Detecção COCO-SSD ativa', 'g');
+}
+
+function stopDetection() {
+  if (detectLoop) { clearInterval(detectLoop); detectLoop = null; }
+  currDetections = [];
+  MO.currPeople  = 0;
+}
+
 
 // ══════════════════════════════════════════
 //  ZONES
@@ -1709,30 +1835,21 @@ function applyZoneNames() {
 }
 
 function recalibrate() {
-  BG.model = null;
-  BG.calibrated = false;
-  BG.frameCount = 0;
-  TEMPORAL.buffer = [];
-  TEMPORAL.stable = 0;
-  MO.currBlobs = [];
-  addLog('🔧 Recalibrando fundo...', 'c');
+  addLog('ℹ️ Motor COCO-SSD não requer calibração', 'c');
 }
 
 function resetSession() {
   if (!confirm('Resetar todos os dados da sessão?')) return;
   totalVisits = 0; peakOccupancy = 0; peakTime = null; alertCount = 0;
-  visitDurations = []; occupancyHistory = []; visitors = []; visitorIdCounter = 0;
+  visitDurations = []; occupancyHistory = [];
   Object.keys(ZONES).forEach(k => { ZONES[k].count = 0; ZONES[k].seconds = 0; });
-  if (BG.tvSuppress) BG.tvSuppress.fill(0);
-  BLOB.staleFrames = {};
-  BLOB.prevBlobs   = [];
-  MO.gazeHeat.fill(0);
-  BG.model = null; BG.calibrated = false; BG.frameCount = 0; BG.prevGray = null;
-  TEMPORAL.buffer = []; TEMPORAL.stable = 0; MO.currBlobs = [];
+  gazeHeat.fill(0);
+  TRACKER.people = []; TRACKER.nextId = 1;
   ['A','B','C','D'].forEach(k => { zoneActiveTimers[k] = 0; });
   ['totalToday','peakCount','aAlerts','aTotalVisits'].forEach(id => {
     const el = document.getElementById(id); if(el) el.textContent = '0';
   });
+  updateVisitorListFromTracker();
   addLog('Sessão resetada', 'y');
 }
 
@@ -1751,7 +1868,10 @@ function exportData() {
     ['Zona B (s)', ZONES.B.seconds],
     ['Zona C (s)', ZONES.C.seconds],
     ['Zona D (s)', ZONES.D.seconds],
-    ...visitors.map(v => [`Visitante #${v.id}`, `${fmtSec(v.duration)} | ${v.pathZones.join('>')}`])
+    ...TRACKER.people.map(p => {
+      const dur = Math.floor((p.lastSeen - p.firstSeen) / 1000);
+      return [`Pessoa #${p.id}`, `${fmtSec(dur)} | ${p.pathZones.join('>')}`];
+    })
   ];
   const csv = rows.map(r => r.join(',')).join('\n');
   const blob = new Blob([csv], { type: 'text/csv' });
