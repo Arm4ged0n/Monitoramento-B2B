@@ -1039,6 +1039,7 @@ function initBGModel() {
   const N = MO.W * MO.H;
   BG.model      = new Float32Array(N).fill(128);
   BG.tvSuppress = new Float32Array(N).fill(0);
+  BG.prevGray   = null;
   BG.frameCount = 0;
   BG.calibrated = false;
   TEMPORAL.buffer = [];
@@ -1061,95 +1062,103 @@ function analyzeFrame() {
     gray[i] = 0.299 * raw[i*4] + 0.587 * raw[i*4+1] + 0.114 * raw[i*4+2];
   }
 
-  // Inicializar modelo na 1ª chamada
-  if (!BG.model) { initBGModel(); BG.model.set(gray); return; }
+  // Inicializar na 1ª chamada
+  if (!BG.model) { initBGModel(); BG.model.set(gray); BG.prevGray = gray.slice(); return; }
 
   BG.frameCount++;
 
   // ── CALIBRAÇÃO ──
-  // Nos primeiros N frames: só aprender o fundo, não detectar nada
   if (BG.frameCount <= BG.CALIB_FRAMES) {
     for (let i = 0; i < gray.length; i++) {
-      BG.model[i] += 0.15 * (gray[i] - BG.model[i]); // aprender rápido durante calibração
+      BG.model[i] += 0.2 * (gray[i] - BG.model[i]);
     }
     const pct = Math.round((BG.frameCount / BG.CALIB_FRAMES) * 100);
     document.getElementById('detectEl').textContent = `cal ${pct}%`;
     updatePeopleUI(0);
-    // Ainda desenhar as zonas durante calibração
-    drawOverlay(new Array(GRID_COLS * GRID_ROWS).fill(0), { A:0, B:0, C:0, D:0 }, []);
+    drawOverlay(new Array(GRID_COLS * GRID_ROWS).fill(0), {A:0,B:0,C:0,D:0}, []);
     if (BG.frameCount === BG.CALIB_FRAMES) {
       BG.calibrated = true;
-      addLog('✅ Pronto! Aponte para a loja', 'g');
+      addLog('✅ Calibrado! Detectando pessoas...', 'g');
     }
+    BG.prevGray = gray.slice();
     return;
   }
 
-  // ── FOREGROUND MASK ──
-  // Threshold fixo baseado na diferença absoluta do modelo de fundo
-  // Sensibilidade: slider 1-10 → threshold 28 a 8 (mais sensível = menor threshold)
-  const threshold = Math.round(28 - (sensitivity - 1) * 2.2);
+  // ── DETECÇÃO DUAL: frame-diff + background subtraction ──
+  // frame-diff: detecta QUALQUER movimento (pessoa parada por <3s aparece)
+  // bg-subtract: detecta objetos que diferem do fundo aprendido
+  // UNION dos dois → máxima sensibilidade
+  const threshBG   = Math.max(8, 28 - sensitivity * 2);   // bg subtraction threshold
+  const threshDiff = Math.max(6, 20 - sensitivity * 1.5); // frame diff threshold
+
   const fgMask = new Uint8Array(MO.W * MO.H);
   const hmap   = new Array(HMAP_COLS * HMAP_ROWS).fill(0);
   const gw = MO.W / HMAP_COLS, gh = MO.H / HMAP_ROWS;
 
   for (let i = 0; i < gray.length; i++) {
-    const diff = Math.abs(gray[i] - BG.model[i]);
-    const isFG = diff > threshold;
+    const bgDiff   = Math.abs(gray[i] - BG.model[i]);
+    const frameDiff = BG.prevGray ? Math.abs(gray[i] - BG.prevGray[i]) : 0;
+
+    // FG se diferir do fundo OU se houver movimento em relação ao frame anterior
+    const isFG = bgDiff > threshBG || frameDiff > threshDiff;
 
     if (isFG) {
       fgMask[i] = 1;
       const px = i % MO.W, py = Math.floor(i / MO.W);
       const hc = Math.min(HMAP_COLS-1, Math.floor(px / gw));
       const hr = Math.min(HMAP_ROWS-1, Math.floor(py / gh));
-      hmap[hr * HMAP_COLS + hc] += diff;
+      hmap[hr * HMAP_COLS + hc] += Math.max(bgDiff, frameDiff);
     }
 
-    // Atualizar fundo: pixels fundo aprendem devagar; pixels FG aprendem muito devagar
-    const lr = isFG ? BG.LEARN_RATE : BG.LEARN_RATE * 3;
+    // Atualizar modelo de fundo: muito devagar para foreground, moderado para fundo
+    const lr = isFG ? 0.003 : 0.008;
     BG.model[i] += lr * (gray[i] - BG.model[i]);
   }
 
-  // Atualizar heatmap de atenção
+  // Salvar frame atual para próxima iteração
+  BG.prevGray = gray.slice();
+
+  // Atualizar heatmap
   for (let i = 0; i < MO.gazeHeat.length; i++) {
     MO.gazeHeat[i] = MO.gazeHeat[i] * 0.97 + hmap[i] * 0.3;
   }
 
-  // ── MORFOLOGIA: erosão leve (remove pixels isolados) ──
-  const cleaned = new Uint8Array(MO.W * MO.H);
+  // ── DILATAÇÃO: unir pixels próximos em blobs coesos ──
+  const dilated = new Uint8Array(MO.W * MO.H);
   for (let py = 1; py < MO.H-1; py++) {
     for (let px = 1; px < MO.W-1; px++) {
       const i = py * MO.W + px;
-      if (!fgMask[i]) continue;
-      const n = fgMask[i-1] + fgMask[i+1] + fgMask[i-MO.W] + fgMask[i+MO.W];
-      if (n >= 1) cleaned[i] = 1;
+      if (fgMask[i] || fgMask[i-1] || fgMask[i+1] || fgMask[i-MO.W] || fgMask[i+MO.W]) {
+        dilated[i] = 1;
+      }
     }
   }
 
-  // ── GRID 4x4: contar pixels FG por célula ──
+  // ── GRID 4x4 ──
   const cellW = MO.W / GRID_COLS, cellH = MO.H / GRID_ROWS;
   const grid  = new Array(GRID_COLS * GRID_ROWS).fill(0);
-  for (let i = 0; i < cleaned.length; i++) {
-    if (!cleaned[i]) continue;
+  for (let i = 0; i < dilated.length; i++) {
+    if (!dilated[i]) continue;
     const px = i % MO.W, py = Math.floor(i / MO.W);
     const gc = Math.min(GRID_COLS-1, Math.floor(px / cellW));
     const gr = Math.min(GRID_ROWS-1, Math.floor(py / cellH));
     grid[gr * GRID_COLS + gc]++;
   }
 
-  // ── DETECÇÃO DE BLOBS (BFS no grid) ──
-  const minCellActivity = Math.max(1, Math.round(threshold * 0.3));
+  // ── BLOBS (BFS) ──
+  const CELL_MIN = 1;
   const visited = new Array(GRID_COLS * GRID_ROWS).fill(false);
   const blobs   = [];
 
   for (let start = 0; start < grid.length; start++) {
-    if (visited[start] || grid[start] < minCellActivity) continue;
+    if (visited[start] || grid[start] < CELL_MIN) continue;
     const queue = [start];
     visited[start] = true;
     let area = 0, minC = GRID_COLS, maxC = 0, minR = GRID_ROWS, maxR = 0;
 
     while (queue.length) {
       const cur = queue.shift();
-      const cc = cur % GRID_COLS, cr = Math.floor(cur / GRID_COLS);
+      const cc  = cur % GRID_COLS, cr = Math.floor(cur / GRID_COLS);
       area += grid[cur];
       minC = Math.min(minC, cc); maxC = Math.max(maxC, cc);
       minR = Math.min(minR, cr); maxR = Math.max(maxR, cr);
@@ -1158,7 +1167,7 @@ function analyzeFrame() {
         const nc = cc+dc, nr = cr+dr;
         if (nc < 0 || nc >= GRID_COLS || nr < 0 || nr >= GRID_ROWS) return;
         const ni = nr * GRID_COLS + nc;
-        if (visited[ni] || grid[ni] < minCellActivity) return;
+        if (visited[ni] || grid[ni] < CELL_MIN) return;
         visited[ni] = true;
         queue.push(ni);
       });
@@ -1166,22 +1175,16 @@ function analyzeFrame() {
 
     const blobW  = maxC - minC + 1;
     const blobH  = maxR - minR + 1;
-    const aspect = blobH === 0 ? 0 : blobW / blobH;
+    const aspect = blobH === 0 ? 99 : blobW / blobH;
     const cx = (minC + maxC) / 2, cy = (minR + maxR) / 2;
 
-    if (
-      area    >= BLOB.MIN_AREA   &&
-      area    <= BLOB.MAX_AREA   &&
-      aspect  >= BLOB.MIN_ASPECT &&
-      aspect  <= BLOB.MAX_ASPECT
-    ) {
+    // Filtros mínimos: só rejeitar ruído minúsculo (area<3) ou frame inteiro (area>500)
+    if (area >= 3 && area <= 500 && aspect <= 5.0) {
       blobs.push({ area, minC, maxC, minR, maxR, cx, cy });
     }
   }
 
-  BLOB.prevBlobs = blobs.map(b => ({ cx: b.cx, cy: b.cy }));
-
-  // ── ESTABILIZAÇÃO TEMPORAL (mediana) ──
+  // ── ESTABILIZAÇÃO: mediana de 4 frames ──
   TEMPORAL.buffer.push(blobs.length);
   if (TEMPORAL.buffer.length > TEMPORAL.WINDOW) TEMPORAL.buffer.shift();
   const sorted = [...TEMPORAL.buffer].sort((a,b) => a-b);
@@ -1190,8 +1193,8 @@ function analyzeFrame() {
   MO.currPeople = TEMPORAL.stable;
   MO.currBlobs  = blobs;
 
-  // ── ZONAS ──
-  const motionThresh = minCellActivity * 3;
+  // ── ZONAS: quadrantes do grid 4x4 ──
+  const ZONE_THRESH = 2;
   const zoneMotion = {
     A: grid[0]+grid[1]+grid[4]+grid[5],
     B: grid[2]+grid[3]+grid[6]+grid[7],
@@ -1201,7 +1204,7 @@ function analyzeFrame() {
 
   let zonesActiveCount = 0;
   Object.entries(zoneMotion).forEach(([key, val]) => {
-    const isActive = val > motionThresh;
+    const isActive = val >= ZONE_THRESH;
     if (isActive) zonesActiveCount++;
     updateZoneActive(key, isActive, val);
   });
@@ -1212,11 +1215,12 @@ function analyzeFrame() {
   MO.gazeHeat.forEach((v, i) => {
     const col = i % HMAP_COLS, row = Math.floor(i / HMAP_COLS);
     const isLeft = col < HMAP_COLS/2, isTop = row < HMAP_ROWS/2;
-    const isCenter = col >= HMAP_COLS*0.35 && col < HMAP_COLS*0.65 && row >= HMAP_ROWS*0.35 && row < HMAP_ROWS*0.65;
-    if (isCenter) quadrantHeat[2] += v;
-    else if (isTop && isLeft) quadrantHeat[0] += v;
+    const isCenter = col >= HMAP_COLS*0.35 && col < HMAP_COLS*0.65 &&
+                     row >= HMAP_ROWS*0.35 && row < HMAP_ROWS*0.65;
+    if (isCenter)          quadrantHeat[2] += v;
+    else if (isTop && isLeft)  quadrantHeat[0] += v;
     else if (isTop && !isLeft) quadrantHeat[1] += v;
-    else quadrantHeat[3] += v;
+    else                   quadrantHeat[3] += v;
   });
   const qTotal = quadrantHeat.reduce((a,b) => a+b, 0) || 1;
   ['gazeA','gazeB','gazeC','gazeD'].forEach((id,i) => {
@@ -1229,7 +1233,7 @@ function analyzeFrame() {
   drawOverlay(grid, zoneMotion, blobs);
   renderGazeHeatmap();
   renderHistoryChart();
-  manageVisitors(TEMPORAL.stable, zoneMotion, motionThresh);
+  manageVisitors(TEMPORAL.stable, zoneMotion, ZONE_THRESH);
 }
 
 // ══════════════════════════════════════════
@@ -1723,7 +1727,7 @@ function resetSession() {
   BLOB.staleFrames = {};
   BLOB.prevBlobs   = [];
   MO.gazeHeat.fill(0);
-  BG.model = null; BG.calibrated = false; BG.frameCount = 0;
+  BG.model = null; BG.calibrated = false; BG.frameCount = 0; BG.prevGray = null;
   TEMPORAL.buffer = []; TEMPORAL.stable = 0; MO.currBlobs = [];
   ['A','B','C','D'].forEach(k => { zoneActiveTimers[k] = 0; });
   ['totalToday','peakCount','aAlerts','aTotalVisits'].forEach(id => {
