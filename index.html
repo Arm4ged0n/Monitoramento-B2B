@@ -97,7 +97,8 @@ header {
   overflow: hidden;
 }
 video { width: 100%; height: 100%; object-fit: cover; display: none; }
-canvas#overlayCanvas { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; z-index: 10; }
+canvas#overlayCanvas  { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; z-index: 10; }
+canvas#heatmapOverlay { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; z-index: 9; display: none; }
 
 .no-cam {
   position: absolute; inset: 0;
@@ -429,6 +430,75 @@ input[type=range]::-webkit-slider-thumb {
 input:checked + .toggle-slider { background: rgba(0,212,255,0.3); border: 1px solid var(--cyan); }
 input:checked + .toggle-slider:before { transform: translateX(18px); background: var(--cyan); }
 
+/* ── HEATMAP OVERLAY ── */
+#heatmapOverlay {
+  position: absolute; inset: 0;
+  pointer-events: none; z-index: 8;
+  opacity: 0; transition: opacity 0.4s;
+  display: none;
+}
+#heatmapOverlay.visible { opacity: 1; display: block; }
+
+.heatmap-toggle {
+  display: flex; align-items: center; gap: 5px;
+  padding: 5px 10px; border-radius: 6px;
+  font-size: 0.68rem; font-weight: 600;
+  background: transparent; border: 1px solid var(--border2);
+  color: var(--muted); cursor: pointer; transition: all 0.2s;
+  font-family: var(--sans);
+}
+.heatmap-toggle.on {
+  border-color: var(--orange); color: var(--orange);
+  background: rgba(255,122,47,0.1);
+  box-shadow: 0 0 8px rgba(255,122,47,0.2);
+}
+
+/* Painel heatmap dedicado */
+.heatmap-panel {
+  background: var(--card); border: 1px solid var(--border);
+  border-radius: 12px; overflow: hidden;
+}
+.heatmap-panel-header {
+  padding: 12px 14px; border-bottom: 1px solid var(--border);
+  display: flex; align-items: center; justify-content: space-between;
+}
+.heatmap-panel-title {
+  font-family: var(--mono); font-size: 0.65rem;
+  color: var(--muted); letter-spacing: 1px; text-transform: uppercase;
+}
+#gazeCanvasLarge {
+  width: 100%; display: block; background: #060a0d;
+}
+.heatmap-legend {
+  display: flex; justify-content: center; gap: 16px;
+  padding: 10px 14px; border-top: 1px solid var(--border);
+  flex-wrap: wrap;
+}
+.heatmap-legend-item {
+  display: flex; align-items: center; gap: 6px;
+  font-size: 0.62rem; color: var(--muted);
+}
+.heatmap-legend-color {
+  width: 28px; height: 8px; border-radius: 4px;
+}
+.heatmap-stats-grid {
+  display: grid; grid-template-columns: 1fr 1fr;
+  gap: 8px; padding: 12px 14px;
+  border-top: 1px solid var(--border);
+}
+.heatmap-stat {
+  background: var(--card2); border: 1px solid var(--border);
+  border-radius: 8px; padding: 10px;
+}
+.heatmap-stat-val {
+  font-family: var(--mono); font-size: 1.1rem; font-weight: 700;
+  color: var(--orange); line-height: 1;
+}
+.heatmap-stat-label {
+  font-size: 0.58rem; color: var(--muted); margin-top: 3px;
+  text-transform: uppercase; letter-spacing: 0.5px;
+}
+
 /* ── BOTTOM ── */
 .bottom {
   background: var(--surface); border-top: 1px solid var(--border);
@@ -477,6 +547,7 @@ input:checked + .toggle-slider:before { transform: translateX(18px); background:
     <span>ZONES <b id="zonesActive">0</b>/4</span>
   </div>
   <div class="cam-actions">
+    <button class="heatmap-toggle" id="heatmapToggleBtn" onclick="toggleHeatmapOverlay()">🔥 Heat</button>
     <button class="btn btn-ghost btn-sm" onclick="triggerBeep()">🔊</button>
     <button class="btn btn-primary btn-sm" id="startBtn" onclick="startCamera()">▶ Iniciar</button>
     <button class="btn btn-danger btn-sm" id="stopBtn" style="display:none" onclick="stopCamera()">■ Parar</button>
@@ -494,6 +565,7 @@ input:checked + .toggle-slider:before { transform: translateX(18px); background:
     <p>Câmera offline<br>Toque em ▶ Iniciar para começar</p>
   </div>
   <video id="videoEl" autoplay muted playsinline></video>
+  <canvas id="heatmapOverlay"></canvas>
   <canvas id="overlayCanvas"></canvas>
   <div class="scan-line" id="scanLine"></div>
 </div>
@@ -650,40 +722,63 @@ input:checked + .toggle-slider:before { transform: translateX(18px); background:
     </div>
   </div>
 
-  <!-- ── TAB: ATENÇÃO ── -->
+
+  <!-- ── TAB: ATENÇÃO / HEATMAP ── -->
   <div class="panel" id="panel-gaze">
-    <div class="heatmap-wrap">
-      <div class="section-title">Mapa de Calor de Atenção</div>
-      <canvas id="gazeCanvas" height="200"></canvas>
-      <div class="gaze-legend">
-        <div class="gaze-legend-item"><div class="gaze-color" style="background:#ff0000"></div>Alta atenção</div>
-        <div class="gaze-legend-item"><div class="gaze-color" style="background:#ff8800"></div>Média</div>
-        <div class="gaze-legend-item"><div class="gaze-color" style="background:#ffff00"></div>Baixa</div>
-        <div class="gaze-legend-item"><div class="gaze-color" style="background:#0044ff"></div>Sem atenção</div>
+
+    <div class="heatmap-panel">
+      <div class="heatmap-panel-header">
+        <div class="heatmap-panel-title">🔥 Mapa de Calor — Atenção Acumulada</div>
+        <button class="btn btn-ghost btn-sm" onclick="clearHeatmap()">Limpar</button>
+      </div>
+      <canvas id="gazeCanvasLarge" height="260"></canvas>
+      <div class="heatmap-legend">
+        <div class="heatmap-legend-item">
+          <div class="heatmap-legend-color" style="background:linear-gradient(90deg,#000080,#0000ff,#00ffff,#ffff00,#ff8800,#ff0000)"></div>
+          <span>Baixa → Alta atenção</span>
+        </div>
+      </div>
+      <div class="heatmap-stats-grid">
+        <div class="heatmap-stat">
+          <div class="heatmap-stat-val" id="heatHotZone">—</div>
+          <div class="heatmap-stat-label">Zona mais quente</div>
+        </div>
+        <div class="heatmap-stat">
+          <div class="heatmap-stat-val" id="heatMaxVal">0</div>
+          <div class="heatmap-stat-label">Intensidade máxima</div>
+        </div>
+        <div class="heatmap-stat">
+          <div class="heatmap-stat-val" id="heatFrames">0</div>
+          <div class="heatmap-stat-label">Frames acumulados</div>
+        </div>
+        <div class="heatmap-stat">
+          <div class="heatmap-stat-val" id="heatCoverage">0%</div>
+          <div class="heatmap-stat-label">Cobertura ativa</div>
+        </div>
       </div>
     </div>
 
     <div class="zone-setup">
-      <div class="section-title">Pontos de Interesse Detectados</div>
-      <div class="attention-zones" id="gazeZoneBars">
+      <div class="section-title">Distribuição de Atenção por Zona</div>
+      <div class="attention-zones">
         <div class="attention-row">
-          <div class="attention-label">Topo-Esquerda</div>
-          <div class="attention-track"><div class="attention-fill" id="gazeA" style="width:0%;background:#00d4ff"></div></div>
+          <div class="attention-label">🔵 A · Entrada</div>
+          <div class="attention-track"><div class="attention-fill" id="gazeA" style="width:0%;background:var(--cyan)"></div></div>
           <div class="attention-pct" id="gazeApct">0%</div>
         </div>
         <div class="attention-row">
-          <div class="attention-label">Topo-Direita</div>
-          <div class="attention-track"><div class="attention-fill" id="gazeB" style="width:0%;background:#ff7a2f"></div></div>
+          <div class="attention-label">🟠 B · Produtos</div>
+          <div class="attention-track"><div class="attention-fill" id="gazeB" style="width:0%;background:var(--orange)"></div></div>
           <div class="attention-pct" id="gazeBpct">0%</div>
         </div>
         <div class="attention-row">
-          <div class="attention-label">Centro</div>
-          <div class="attention-track"><div class="attention-fill" id="gazeC" style="width:0%;background:#ffc542"></div></div>
+          <div class="attention-label">🟢 C · Caixa</div>
+          <div class="attention-track"><div class="attention-fill" id="gazeC" style="width:0%;background:var(--green)"></div></div>
           <div class="attention-pct" id="gazeCpct">0%</div>
         </div>
         <div class="attention-row">
-          <div class="attention-label">Baixo-Direita</div>
-          <div class="attention-track"><div class="attention-fill" id="gazeD" style="width:0%;background:#a855f7"></div></div>
+          <div class="attention-label">🟣 D · Vitrine</div>
+          <div class="attention-track"><div class="attention-fill" id="gazeD" style="width:0%;background:var(--purple)"></div></div>
           <div class="attention-pct" id="gazeDpct">0%</div>
         </div>
       </div>
@@ -691,7 +786,7 @@ input:checked + .toggle-slider:before { transform: translateX(18px); background:
 
     <div style="background:var(--card);border:1px solid var(--border);border-radius:10px;padding:12px">
       <div class="section-title">Como funciona</div>
-      <p style="font-size:0.7rem;color:var(--muted);line-height:1.6">O sistema analisa regiões de <b style="color:var(--text)">variação de brilho</b> no frame (movimento óptico). Áreas com mais variação temporal indicam onde há mais atividade de pessoas. O mapa de calor acumula esses dados ao longo do tempo para identificar os <b style="color:var(--cyan)">pontos de interesse</b> mais visitados da loja.</p>
+      <p style="font-size:0.7rem;color:var(--muted);line-height:1.6">O heatmap acumula a <b style="color:var(--text)">posição central de cada pessoa</b> detectada ao longo da sessão. Quanto mais tempo uma pessoa permanece em uma área, mais quente fica. Use o botão <b style="color:var(--orange)">🔥 Heat</b> na câmera para ver a sobreposição em tempo real.</p>
     </div>
   </div>
 
@@ -882,24 +977,12 @@ const ZONES = {
   D: { name: 'Vitrine', color: '#a855f7', count: 0, totalTime: 0, seconds: 0 },
 };
 
-// Motion engine
+// Motion engine (canvas auxiliar para análise)
 const MO = {
-  prevFrame: null,
   currPeople: 0,
-  motionGrid: new Array(16).fill(0), // 4x4 grid
-  gazeHeat: new Array(20 * 15).fill(0), // 20x15 heatmap
-  worker: null,
-  capCanvas: null,
-  capCtx: null,
+  currBlobs:  [],
   W: 60, H: 45,
 };
-MO.capCanvas = document.createElement('canvas');
-MO.capCanvas.width = MO.W; MO.capCanvas.height = MO.H;
-MO.capCtx = MO.capCanvas.getContext('2d', { willReadFrequently: true });
-
-// Visitors
-let visitors = [];
-let visitorIdCounter = 0;
 
 // DOM
 const video = document.getElementById('videoEl');
@@ -946,7 +1029,6 @@ async function startCamera() {
       overlayCanvas.width  = video.videoWidth;
       overlayCanvas.height = video.videoHeight;
       document.getElementById('resEl').textContent = video.videoWidth + '×' + video.videoHeight;
-      initGazeCanvas();
     };
     trackFPS();
     startDetection();
@@ -1457,87 +1539,14 @@ function updatePeopleUI(count) {
 }
 
 // ══════════════════════════════════════════
-//  VISITOR TRACKING
+//  VISITOR TRACKING (via TRACKER do COCO-SSD)
 // ══════════════════════════════════════════
-function manageVisitors(count, zoneMotion, thresh) {
-  const activeCount = visitors.filter(v => v.active).length;
-
-  if (count > activeCount) {
-    // New visitor
-    for (let i = 0; i < count - activeCount; i++) {
-      const id = ++visitorIdCounter;
-      const topZone = Object.entries(zoneMotion).sort((a,b)=>b[1]-a[1])[0][0];
-      const v = {
-        id, active: true, startTime: Date.now(),
-        zone: topZone, pathZones: [topZone],
-        duration: 0,
-      };
-      visitors.push(v);
-      totalVisits++;
-      document.getElementById('totalToday').textContent = totalVisits;
-      document.getElementById('aTotalVisits').textContent = totalVisits;
-      addLog(`👤 Visitante #${id} entrou · Zona ${topZone}`, 'g');
-      if (alertSoundOn) triggerBeep();
-      updateVisitorList();
-    }
-  } else if (count < activeCount) {
-    // Visitor left
-    const active = visitors.filter(v => v.active);
-    for (let i = 0; i < activeCount - count; i++) {
-      if (active[i]) closeVisitor(active[i]);
-    }
-  }
-
-  // Update zones for active visitors
-  const topZone = Object.entries(zoneMotion).sort((a,b)=>b[1]-a[1])[0][0];
-  visitors.filter(v => v.active).forEach(v => {
-    v.duration = Math.floor((Date.now() - v.startTime) / 1000);
-    if (zoneMotion[topZone] > thresh && !v.pathZones.includes(topZone)) {
-      v.pathZones.push(topZone);
-      v.zone = topZone;
-    }
-  });
-
-  updateVisitorList();
-  updateAvgTime();
-}
-
-function closeVisitor(v) {
-  v.active = false;
-  v.duration = Math.floor((Date.now() - v.startTime) / 1000);
-  if (v.duration >= minVisitTime) {
-    visitDurations.push(v.duration);
-    addLog(`👤 Visitante #${v.id} saiu · ${fmtSec(v.duration)} · Zonas: ${v.pathZones.join('→')}`, 'y');
-  }
-  updateAvgTime();
-  updateVisitorList();
-}
-
 function updateAvgTime() {
   if (visitDurations.length === 0) return;
   const avg = Math.floor(visitDurations.reduce((a,b)=>a+b,0) / visitDurations.length);
   const fmt = fmtSec(avg);
   document.getElementById('avgTime').textContent = fmt;
   document.getElementById('aAvgDuration').textContent = fmt;
-}
-
-function updateVisitorList() {
-  const el = document.getElementById('visitorList');
-  const all = [...visitors].reverse().slice(0, 12);
-  if (all.length === 0) {
-    el.innerHTML = '<div style="text-align:center;padding:20px;color:var(--muted);font-size:0.75rem">Nenhum visitante detectado ainda</div>';
-    return;
-  }
-  el.innerHTML = all.map(v => `
-    <div class="visitor-item ${v.active ? 'active' : ''}">
-      <div class="visitor-avatar">${v.active ? '🚶' : '✓'}</div>
-      <div class="visitor-info">
-        <div class="visitor-id">VIS-${String(v.id).padStart(3,'0')}</div>
-        <div class="visitor-status">${v.active ? '🔴 Na loja · Zona '+v.zone : '✅ Saiu · '+v.pathZones.join('→')}</div>
-      </div>
-      <div class="visitor-time">${fmtSec(v.duration)}</div>
-    </div>
-  `).join('');
 }
 
 // ══════════════════════════════════════════
@@ -1613,8 +1622,8 @@ function drawOverlay(grid, zoneMotion, blobs) {
   octx.stroke();
   octx.setLineDash([]);
 
-  // ── Bounding boxes das pessoas detectadas ──
-  const blobList = blobs || MO.currBlobs || [];
+  // ── Bounding boxes (legado blob — não usado no modo COCO-SSD) ──
+  const blobList = (blobs && blobs.length > 0) ? blobs : [];
   if (blobList.length > 0) {
     const cellW = W / GRID_COLS, cellH = H / GRID_ROWS;
     blobList.forEach((blob, idx) => {
@@ -1644,12 +1653,12 @@ function drawOverlay(grid, zoneMotion, blobs) {
     });
   }
 
-  // People count badge (topo centro)
+  // Badge contador (topo centro)
   {
-    const count = MO.currPeople || 0;
-    const badge = BG.calibrated
+    const count = TRACKER.people.filter(p => p.active).length;
+    const badge = tfReady
       ? (count > 0 ? `${count} pessoa${count>1?'s':''}` : 'Nenhuma pessoa')
-      : '⏳ Calibrando...';
+      : '🧠 Carregando IA...';
     octx.font = `bold 13px 'Space Mono'`;
     const bw = octx.measureText(badge).width + 22;
     octx.beginPath();
@@ -1657,10 +1666,10 @@ function drawOverlay(grid, zoneMotion, blobs) {
     else octx.rect(W/2 - bw/2, 8, bw, 26);
     octx.fillStyle = 'rgba(0,0,0,0.75)';
     octx.fill();
-    octx.strokeStyle = count > 0 ? '#2ecc8a' : (BG.calibrated ? '#6a7d90' : '#00d4ff');
+    octx.strokeStyle = count > 0 ? '#2ecc8a' : (tfReady ? '#6a7d90' : '#00d4ff');
     octx.lineWidth = 1.5;
     octx.stroke();
-    octx.fillStyle = count > 0 ? '#2ecc8a' : (BG.calibrated ? '#6a7d90' : '#00d4ff');
+    octx.fillStyle = count > 0 ? '#2ecc8a' : (tfReady ? '#6a7d90' : '#00d4ff');
     octx.textAlign = 'center';
     octx.fillText(badge, W/2, 25);
     octx.textAlign = 'left';
@@ -1668,57 +1677,146 @@ function drawOverlay(grid, zoneMotion, blobs) {
 }
 
 // ══════════════════════════════════════════
-//  GAZE HEATMAP
+//  HEATMAP OVERLAY + PAINEL GRANDE
 // ══════════════════════════════════════════
-let gazeCanvas, gctx;
-function initGazeCanvas() {
-  gazeCanvas = document.getElementById('gazeCanvas');
-  gctx = gazeCanvas.getContext('2d');
+let heatmapOverlayOn = false;
+let heatFrameCount   = 0;
+const hmCanvas = document.getElementById('heatmapOverlay');
+const hmCtx    = hmCanvas ? hmCanvas.getContext('2d') : null;
+
+function toggleHeatmapOverlay() {
+  heatmapOverlayOn = !heatmapOverlayOn;
+  const btn = document.getElementById('heatmapToggleBtn');
+  if (heatmapOverlayOn) {
+    hmCanvas.style.display = 'block';
+    hmCanvas.style.opacity = '0.85';
+    btn.classList.add('on');
+    btn.textContent = '🔥 Heat ON';
+  } else {
+    hmCanvas.style.display = 'none';
+    btn.classList.remove('on');
+    btn.textContent = '🔥 Heat';
+  }
+}
+
+function clearHeatmap() {
+  gazeHeat.fill(0);
+  heatFrameCount = 0;
+  ['heatFrames','heatMaxVal'].forEach(id => document.getElementById(id).textContent = '0');
+  document.getElementById('heatCoverage').textContent = '0%';
+  document.getElementById('heatHotZone').textContent = '—';
+  addLog('🔥 Heatmap limpo', 'y');
+}
+
+// Converte 0-1 em cor de heatmap (azul→ciano→verde→amarelo→vermelho)
+function heatColor(t) {
+  const stops = [[0,0,128],[0,0,255],[0,255,255],[0,255,0],[255,255,0],[255,128,0],[255,0,0]];
+  const pos = t * (stops.length - 1);
+  const lo = Math.floor(pos), hi = Math.min(lo+1, stops.length-1), f = pos-lo;
+  return stops[lo].map((c,i) => Math.round(c + f*(stops[hi][i]-c)));
+}
+
+function renderHeatmapOverlay() {
+  if (!hmCanvas || !hmCtx || !overlayCanvas.width) return;
+  hmCanvas.width  = overlayCanvas.width;
+  hmCanvas.height = overlayCanvas.height;
+  const W = hmCanvas.width, H = hmCanvas.height;
+  hmCtx.clearRect(0, 0, W, H);
+  const maxVal = Math.max(...gazeHeat, 0.001);
+  const cw = W/HMAP_COLS, ch = H/HMAP_ROWS;
+  gazeHeat.forEach((v,i) => {
+    const t = v/maxVal;
+    if (t < 0.06) return;
+    const col = i%HMAP_COLS, row = Math.floor(i/HMAP_COLS);
+    const cx = col*cw+cw/2, cy = row*ch+ch/2, r2 = Math.max(cw,ch)*1.6;
+    const [r,g,b] = heatColor(t);
+    const grad = hmCtx.createRadialGradient(cx,cy,0,cx,cy,r2);
+    grad.addColorStop(0,   `rgba(${r},${g},${b},${Math.min(0.75, t*0.8+0.1)})`);
+    grad.addColorStop(1,   `rgba(${r},${g},${b},0)`);
+    hmCtx.fillStyle = grad;
+    hmCtx.beginPath(); hmCtx.arc(cx,cy,r2,0,Math.PI*2); hmCtx.fill();
+  });
 }
 
 function renderGazeHeatmap() {
-  if (!gazeCanvas || !gctx) return;
-  const GW = gazeCanvas.width  = gazeCanvas.parentElement.clientWidth - 28;
-  const GH = gazeCanvas.height = 200;
-  const cellW = GW / HMAP_COLS, cellH = GH / HMAP_ROWS;
+  // Painel grande (tab Atenção)
+  const gc = document.getElementById('gazeCanvasLarge');
+  if (!gc) return;
+  const GW = gc.width  = gc.parentElement ? gc.parentElement.clientWidth : 360;
+  const GH = gc.height = 260;
+  const ctx = gc.getContext('2d');
+  ctx.clearRect(0,0,GW,GH);
+  ctx.fillStyle='#060a0d'; ctx.fillRect(0,0,GW,GH);
 
-  gctx.clearRect(0, 0, GW, GH);
-  gctx.fillStyle = '#0a0e12';
-  gctx.fillRect(0, 0, GW, GH);
+  const maxVal = Math.max(...gazeHeat, 0.001);
+  const cw = GW/HMAP_COLS, ch = GH/HMAP_ROWS;
+  let activeCells = 0, maxIdx = 0;
 
-  const maxHeat = Math.max(...MO.gazeHeat, 1);
-
-  MO.gazeHeat.forEach((v, i) => {
-    const col = i % HMAP_COLS, row = Math.floor(i / HMAP_COLS);
-    const intensity = v / maxHeat;
-    if (intensity < 0.01) return;
-
-    const r = Math.floor(intensity * 255);
-    const g = Math.floor((1 - intensity) * intensity * 4 * 255);
-    const b = Math.floor((1 - intensity) * 255 * 0.3);
-    gctx.fillStyle = `rgba(${r},${g},${b},${Math.min(0.85, intensity * 1.5)})`;
-
-    const x = col * cellW, y = row * cellH;
-    gctx.fillRect(x, y, cellW+1, cellH+1);
+  gazeHeat.forEach((v,i) => {
+    if(v > gazeHeat[maxIdx]) maxIdx = i;
+    const t = v/maxVal;
+    if(t < 0.02) return;
+    activeCells++;
+    const col = i%HMAP_COLS, row = Math.floor(i/HMAP_COLS);
+    const cx = col*cw+cw/2, cy = row*ch+ch/2, radius = Math.max(cw,ch)*1.5;
+    const [r,g,b] = heatColor(t);
+    const grad = ctx.createRadialGradient(cx,cy,0,cx,cy,radius);
+    grad.addColorStop(0, `rgba(${r},${g},${b},${Math.min(0.9,t*0.9+0.15)})`);
+    grad.addColorStop(0.5,`rgba(${r},${g},${b},${Math.min(0.5,t*0.5)})`);
+    grad.addColorStop(1, `rgba(${r},${g},${b},0)`);
+    ctx.fillStyle=grad; ctx.beginPath(); ctx.arc(cx,cy,radius,0,Math.PI*2); ctx.fill();
   });
 
-  // Zone grid
-  gctx.strokeStyle = 'rgba(255,255,255,0.08)';
-  gctx.lineWidth = 1;
-  gctx.setLineDash([4,4]);
-  gctx.beginPath();
-  gctx.moveTo(GW/2, 0); gctx.lineTo(GW/2, GH);
-  gctx.moveTo(0, GH/2); gctx.lineTo(GW, GH/2);
-  gctx.stroke();
-  gctx.setLineDash([]);
-
-  // Labels
-  const labels = [['A·Entrada','#00d4ff'], ['B·Produtos','#ff7a2f'], ['C·Caixa','#2ecc8a'], ['D·Vitrine','#a855f7']];
-  [[6, 14],[GW/2+6, 14],[6, GH/2+14],[GW/2+6, GH/2+14]].forEach(([x,y],i) => {
-    gctx.font = "9px 'Space Mono'";
-    gctx.fillStyle = labels[i][1] + 'aa';
-    gctx.fillText(labels[i][0], x, y);
+  // Zonas
+  const zColors=['#00d4ff','#ff7a2f','#2ecc8a','#a855f7'];
+  const zLabels=['A · Entrada','B · Produtos','C · Caixa','D · Vitrine'];
+  [[0,0],[GW/2,0],[0,GH/2],[GW/2,GH/2]].forEach(([x,y],i)=>{
+    ctx.strokeStyle=zColors[i]+'55'; ctx.lineWidth=1; ctx.setLineDash([4,4]);
+    ctx.strokeRect(x+1,y+1,GW/2-2,GH/2-2); ctx.setLineDash([]);
+    ctx.font="bold 10px 'Space Mono',monospace";
+    ctx.fillStyle=zColors[i]+'cc'; ctx.fillText(zLabels[i],x+6,y+14);
   });
+
+  // Crosshair ponto mais quente
+  if(gazeHeat[maxIdx]>0.1){
+    const hcol=maxIdx%HMAP_COLS, hrow=Math.floor(maxIdx/HMAP_COLS);
+    const hx=hcol*cw+cw/2, hy=hrow*ch+ch/2;
+    ctx.strokeStyle='#ffffff66'; ctx.lineWidth=1; ctx.setLineDash([3,3]);
+    ctx.beginPath(); ctx.moveTo(hx,0); ctx.lineTo(hx,GH); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(0,hy); ctx.lineTo(GW,hy); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.beginPath(); ctx.arc(hx,hy,6,0,Math.PI*2);
+    ctx.strokeStyle='#fff'; ctx.lineWidth=2; ctx.stroke();
+  }
+
+  // Atualizar stats
+  heatFrameCount++;
+  document.getElementById('heatFrames').textContent = heatFrameCount;
+  document.getElementById('heatMaxVal').textContent = maxVal.toFixed(1);
+  document.getElementById('heatCoverage').textContent =
+    Math.round((activeCells/gazeHeat.length)*100)+'%';
+  const zHeat=[0,0,0,0];
+  gazeHeat.forEach((v,i)=>{
+    const col=i%HMAP_COLS, row=Math.floor(i/HMAP_COLS);
+    const isLeft=col<HMAP_COLS/2, isTop=row<HMAP_ROWS/2;
+    if(isTop&&isLeft) zHeat[0]+=v;
+    else if(isTop&&!isLeft) zHeat[1]+=v;
+    else if(!isTop&&isLeft) zHeat[2]+=v;
+    else zHeat[3]+=v;
+  });
+  const hotIdx=zHeat.indexOf(Math.max(...zHeat));
+  document.getElementById('heatHotZone').textContent=zLabels[hotIdx]||'—';
+
+  // Barras de atenção por zona
+  const qTotal=zHeat.reduce((a,b)=>a+b,0)||1;
+  ['gazeA','gazeB','gazeC','gazeD'].forEach((id,i)=>{
+    const pct=Math.round((zHeat[i]/qTotal)*100);
+    document.getElementById(id).style.width=pct+'%';
+    document.getElementById(id+'pct').textContent=pct+'%';
+  });
+
+  // Overlay na câmera se ativo
+  if(heatmapOverlayOn) renderHeatmapOverlay();
 }
 
 // ══════════════════════════════════════════
@@ -1726,7 +1824,8 @@ function renderGazeHeatmap() {
 // ══════════════════════════════════════════
 function recordHistory() {
   if (!isRunning) return;
-  occupancyHistory.push(MO.currPeople);
+  const count = TRACKER.people.filter(p => p.active).length;
+  occupancyHistory.push(count);
   if (occupancyHistory.length > 30) occupancyHistory.shift();
   renderHistoryChart();
 }
@@ -1927,7 +2026,7 @@ function fmtSec(s) {
 }
 
 // Init
-initGazeCanvas();
+addLog('Sistema RetailEye pronto — aguardando câmera', 'g');
 </script>
 </body>
 </html>
