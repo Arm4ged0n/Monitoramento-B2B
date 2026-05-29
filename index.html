@@ -864,8 +864,8 @@ input:checked + .toggle-slider:before { transform: translateX(18px); background:
           <div class="setting-sub">Alerta quando superar N pessoas</div>
         </div>
         <div style="display:flex;align-items:center;gap:8px">
-          <input type="range" min="1" max="20" value="5" id="crowdSlider" oninput="updateCrowd(this.value)">
-          <div class="setting-val" id="crowdVal">5</div>
+          <input type="range" min="1" max="50" value="25" id="crowdSlider" oninput="updateCrowd(this.value)">
+          <div class="setting-val" id="crowdVal">25</div>
         </div>
       </div>
       <div class="setting-row">
@@ -955,7 +955,7 @@ let fpsTracker = { frames: 0, last: Date.now() };
 
 // Settings
 let sensitivity = 5;
-let crowdLimit  = 5;
+let crowdLimit  = 25;
 let minVisitTime = 3;
 let alertSoundOn = true;
 let crowdAlertOn = true;
@@ -1034,6 +1034,7 @@ async function startCamera() {
     startDetection();
     setInterval(updateSessionTimer, 1000);
     setInterval(updateZoneTimes, 1000);
+    setInterval(updateVisitorListFromTracker, 2000); // refresh tempo dos visitantes
     historyInterval = setInterval(recordHistory, 10000);
     if (document.getElementById('wakeLockToggle').checked) requestWakeLock();
     // Pré-carregar modelo assim que câmera abrir
@@ -1094,10 +1095,16 @@ let detectLoop = null;
 
 // Tracker de pessoas por posição (persistência entre frames)
 const TRACKER = {
-  people: [],          // [{id, x, y, w, h, zone, firstSeen, lastSeen, pathZones}]
+  people: [],
   nextId: 1,
-  MAX_DIST: 0.25,      // distância normalizada máxima para considerar mesma pessoa
-  MAX_LOST: 15,        // frames sem detecção antes de remover
+  // Distância máxima normalizada para associar detecção à mesma pessoa
+  // 0.45 = pessoa pode se mover até 45% da largura do frame entre detecções
+  MAX_DIST: 0.45,
+  // Frames perdidos antes de marcar como saiu
+  // 25 frames = ~9s de tolerância (pessoa parcialmente ocluída, virou de costas, etc.)
+  MAX_LOST: 25,
+  // Histórico máximo de pessoas inativas para exibir no log
+  MAX_HISTORY: 100,
 };
 
 // Heatmap acumulado
@@ -1115,7 +1122,7 @@ async function loadModel() {
     tfReady  = true;
     tfLoading = false;
     document.getElementById('detectEl').textContent = 'IA pronta';
-    addLog('✅ Modelo COCO-SSD carregado — detectando pessoas', 'g');
+    addLog('✅ COCO-SSD pronto — cada pessoa recebe um ID único', 'g');
   } catch(e) {
     tfLoading = false;
     addLog('❌ Falha ao carregar modelo: ' + e.message, 'r');
@@ -1128,14 +1135,10 @@ async function runDetection() {
   if (!isRunning || !tfReady || !video.videoWidth) return;
 
   try {
-    // Detectar com COCO-SSD — retorna [{bbox:[x,y,w,h], class, score}]
-    const raw = await tfModel.detect(video, 6, 0.35); // max 6 obj, threshold 35%
-
-    // Filtrar apenas "person"
-    const persons = raw.filter(d => d.class === 'person' && d.score >= 0.38);
+    const raw = await tfModel.detect(video, 10, 0.32); // até 10 pessoas, threshold 32%
+    const persons = raw.filter(d => d.class === 'person' && d.score >= 0.35);
     currDetections = persons;
 
-    // Normalizar coordenadas para 0-1
     const vw = video.videoWidth, vh = video.videoHeight;
     const normalized = persons.map(p => ({
       x:  p.bbox[0] / vw,
@@ -1146,13 +1149,13 @@ async function runDetection() {
       cy: (p.bbox[1] + p.bbox[3]/2) / vh,
       score: p.score,
       bbox: p.bbox,
+      area: (p.bbox[2] * p.bbox[3]) / (vw * vh), // área normalizada
     }));
 
-    // Atualizar heatmap com centróides das pessoas
+    // Heatmap com centróides
     normalized.forEach(p => {
       const hc = Math.min(HMAP_COLS-1, Math.floor(p.cx * HMAP_COLS));
       const hr = Math.min(HMAP_ROWS-1, Math.floor(p.cy * HMAP_ROWS));
-      // Gaussiana simples ao redor do centróide
       for (let dr = -2; dr <= 2; dr++) {
         for (let dc = -2; dc <= 2; dc++) {
           const nc = hc+dc, nr = hr+dr;
@@ -1162,21 +1165,16 @@ async function runDetection() {
         }
       }
     });
-    // Decay do heatmap
     for (let i = 0; i < gazeHeat.length; i++) gazeHeat[i] *= 0.992;
 
-    // Atualizar tracker de pessoas
+    // Tracker com ID persistente
     updateTracker(normalized);
 
-    // Calcular zonas
+    // Zonas por detecção atual
     const zoneMotion = { A:0, B:0, C:0, D:0 };
-    const zoneKeys   = ['A','B','C','D']; // TL, TR, BL, BR
     normalized.forEach(p => {
-      const isLeft = p.cx < 0.5, isTop = p.cy < 0.5;
-      if (isTop  && isLeft)  { zoneMotion.A++; }
-      else if (isTop  && !isLeft) { zoneMotion.B++; }
-      else if (!isTop && isLeft)  { zoneMotion.C++; }
-      else                        { zoneMotion.D++; }
+      const z = getZoneForPoint(p.cx, p.cy);
+      zoneMotion[z]++;
     });
 
     let zonesActive = 0;
@@ -1187,15 +1185,15 @@ async function runDetection() {
     });
     document.getElementById('zonesActive').textContent = zonesActive;
 
-    // Atenção por quadrante do heatmap
+    // Barras de atenção heatmap
     const qHeat = [0,0,0,0];
     gazeHeat.forEach((v,i) => {
-      const col = i % HMAP_COLS, row = Math.floor(i/HMAP_COLS);
-      const isLeft = col < HMAP_COLS/2, isTop = row < HMAP_ROWS/2;
-      if      (isTop  && isLeft)  qHeat[0] += v;
-      else if (isTop  && !isLeft) qHeat[1] += v;
-      else if (!isTop && isLeft)  qHeat[2] += v;
-      else                        qHeat[3] += v;
+      const col = i%HMAP_COLS, row = Math.floor(i/HMAP_COLS);
+      const isLeft = col<HMAP_COLS/2, isTop = row<HMAP_ROWS/2;
+      if      (isTop&&isLeft)  qHeat[0]+=v;
+      else if (isTop&&!isLeft) qHeat[1]+=v;
+      else if (!isTop&&isLeft) qHeat[2]+=v;
+      else                     qHeat[3]+=v;
     });
     const qTotal = qHeat.reduce((a,b)=>a+b,0)||1;
     ['gazeA','gazeB','gazeC','gazeD'].forEach((id,i) => {
@@ -1204,91 +1202,148 @@ async function runDetection() {
       document.getElementById(id+'pct').textContent = pct+'%';
     });
 
-    const count = normalized.length;
-    document.getElementById('detectEl').textContent = count;
-    updatePeopleUI(count);
+    const activeCount = TRACKER.people.filter(p => p.active).length;
+    document.getElementById('detectEl').textContent = activeCount;
+    updatePeopleUI(activeCount);
     drawOverlayTF(normalized, zoneMotion);
     renderGazeHeatmap();
     renderHistoryChart();
-    manageVisitors(count, zoneMotion, 0);
 
-  } catch(e) {
-    // Ignorar erros isolados de frame
-  }
+  } catch(e) { /* ignorar erros isolados de frame */ }
 }
 
-// ── Tracker: associar detecções a pessoas conhecidas ──
+// ══════════════════════════════════════════
+//  TRACKER v2 — ID persistente por pessoa
+//  Algoritmo: Hungarian-like greedy matching
+//  Métrica: combinação de distância euclidiana + similaridade de tamanho (área)
+//  Tolerância: pessoa pode se afastar, sair do frame parcialmente e voltar
+// ══════════════════════════════════════════
 function updateTracker(detections) {
   const now = Date.now();
 
-  // Marcar todas como "não vistas neste frame"
-  TRACKER.people.forEach(p => p.seenThisFrame = false);
+  // ── PASSO 1: calcular matriz de custo entre detecções e pessoas ativas ──
+  // Custo = distância euclidiana + penalidade de diferença de tamanho
+  // Custo < MAX_DIST → mesma pessoa
+  const active = TRACKER.people.filter(p => p.active);
 
-  detections.forEach(det => {
-    // Encontrar pessoa mais próxima no tracker
-    let best = null, bestDist = TRACKER.MAX_DIST;
-    TRACKER.people.forEach(p => {
-      if (!p.active) return;
-      const d = Math.sqrt((p.cx - det.cx)**2 + (p.cy - det.cy)**2);
-      if (d < bestDist) { bestDist = d; best = p; }
+  // Usar posição predita (última posição + velocidade) para melhorar matching
+  active.forEach(p => {
+    // Predição simples: extrapolar com velocidade dos últimos 2 frames
+    p.predictedCx = p.cx + (p.vx || 0);
+    p.predictedCy = p.cy + (p.vy || 0);
+  });
+
+  const matched   = new Set(); // índices de detecções já associadas
+  const matchedP  = new Set(); // IDs de pessoas já associadas
+
+  // Ordenar por confiança (detecções mais certas primeiro)
+  const sorted = [...detections].sort((a,b) => b.score - a.score);
+
+  sorted.forEach(det => {
+    let best = null, bestCost = TRACKER.MAX_DIST;
+
+    active.forEach(p => {
+      if (matchedP.has(p.id)) return; // já associada
+
+      // Distância euclidiana entre centróides (usando posição predita)
+      const dx = (p.predictedCx || p.cx) - det.cx;
+      const dy = (p.predictedCy || p.cy) - det.cy;
+      const dist = Math.sqrt(dx*dx + dy*dy);
+
+      // Penalidade por diferença de área (pessoa não muda muito de tamanho)
+      // Diferença de área > 60% → provavelmente pessoa diferente
+      const areaDiff = p.area > 0 ? Math.abs(p.area - det.area) / Math.max(p.area, det.area) : 0;
+      const areaPenalty = areaDiff > 0.6 ? 0.15 : 0;
+
+      const cost = dist + areaPenalty;
+      if (cost < bestCost) { bestCost = cost; best = p; }
     });
 
     if (best) {
-      // Atualizar pessoa existente
+      // ── Mesma pessoa: atualizar estado ──
+      const prevCx = best.cx, prevCy = best.cy;
+      best.vx = det.cx - prevCx; // velocidade X
+      best.vy = det.cy - prevCy; // velocidade Y
       best.cx = det.cx; best.cy = det.cy;
-      best.x = det.x; best.y = det.y;
-      best.w = det.w; best.h = det.h;
-      best.lastSeen = now;
-      best.seenThisFrame = true;
+      best.x  = det.x;  best.y  = det.y;
+      best.w  = det.w;  best.h  = det.h;
+      best.area      = det.area;
+      best.score     = det.score;
+      best.lastSeen  = now;
       best.lostFrames = 0;
 
-      // Atualizar zona
+      // Trajetória de zonas
       const zone = getZoneForPoint(det.cx, det.cy);
       if (zone !== best.zone) {
-        if (!best.pathZones.includes(zone)) best.pathZones.push(zone);
         best.zone = zone;
+        if (!best.pathZones.includes(zone)) {
+          best.pathZones.push(zone);
+          addLog(`🚶 Pessoa #${best.id} → Zona ${zone}`, 'c');
+        }
       }
-    } else {
-      // Nova pessoa
-      const zone = getZoneForPoint(det.cx, det.cy);
-      const id = TRACKER.nextId++;
-      TRACKER.people.push({
-        id, cx: det.cx, cy: det.cy,
-        x: det.x, y: det.y, w: det.w, h: det.h,
-        zone, pathZones: [zone],
-        firstSeen: now, lastSeen: now,
-        active: true, seenThisFrame: true, lostFrames: 0,
-      });
-      totalVisits++;
-      document.getElementById('totalToday').textContent = totalVisits;
-      document.getElementById('aTotalVisits').textContent = totalVisits;
-      addLog(`👤 Pessoa #${id} detectada · Zona ${zone}`, 'g');
-      if (alertSoundOn) triggerBeep();
+
+      matched.add(det);
+      matchedP.add(best.id);
+    }
+    // Se não encontrou match → nova pessoa (tratado abaixo)
+  });
+
+  // ── PASSO 2: detecções sem match = nova pessoa ──
+  sorted.forEach(det => {
+    if (matched.has(det)) return;
+
+    const zone = getZoneForPoint(det.cx, det.cy);
+    const id   = TRACKER.nextId++;
+    TRACKER.people.push({
+      id,
+      cx: det.cx, cy: det.cy,
+      x: det.x,   y: det.y,
+      w: det.w,   h: det.h,
+      area: det.area, score: det.score,
+      vx: 0, vy: 0,
+      zone, pathZones: [zone],
+      firstSeen: now, lastSeen: now,
+      active: true, lostFrames: 0,
+    });
+
+    totalVisits++;
+    document.getElementById('totalToday').textContent = totalVisits;
+    document.getElementById('aTotalVisits').textContent = totalVisits;
+    addLog(`👤 Pessoa #${id} entrou · Zona ${zone} · Confiança ${Math.round(det.score*100)}%`, 'g');
+    if (alertSoundOn) triggerBeep();
+    updateVisitorListFromTracker();
+  });
+
+  // ── PASSO 3: pessoas não vistas = incrementar lostFrames ──
+  TRACKER.people.forEach(p => {
+    if (!p.active || matchedP.has(p.id)) return;
+    p.lostFrames = (p.lostFrames||0) + 1;
+
+    if (p.lostFrames > TRACKER.MAX_LOST) {
+      p.active = false;
+      const dur = Math.floor((p.lastSeen - p.firstSeen) / 1000);
+      if (dur >= minVisitTime) {
+        visitDurations.push(dur);
+        updateAvgTime();
+        addLog(`✅ Pessoa #${p.id} saiu · ${fmtSec(dur)} · Percurso: ${p.pathZones.join(' → ')}`, 'y');
+      }
       updateVisitorListFromTracker();
     }
   });
 
-  // Incrementar lostFrames para quem não foi visto
-  TRACKER.people.forEach(p => {
-    if (!p.seenThisFrame && p.active) {
-      p.lostFrames = (p.lostFrames||0) + 1;
-      if (p.lostFrames > TRACKER.MAX_LOST) {
-        p.active = false;
-        const dur = Math.floor((p.lastSeen - p.firstSeen) / 1000);
-        if (dur >= minVisitTime) {
-          visitDurations.push(dur);
-          addLog(`👤 Pessoa #${p.id} saiu · ${fmtSec(dur)} · ${p.pathZones.join('→')}`, 'y');
-          updateAvgTime();
-        }
-        updateVisitorListFromTracker();
-      }
-    }
-  });
-
-  // Limpar pessoas muito antigas inativas
-  if (TRACKER.people.length > 50) {
-    TRACKER.people.splice(0, TRACKER.people.length - 50);
+  // ── PASSO 4: manter histórico limitado ──
+  const inactive = TRACKER.people.filter(p => !p.active);
+  if (inactive.length > TRACKER.MAX_HISTORY) {
+    // Remover os mais antigos
+    const toRemove = inactive.length - TRACKER.MAX_HISTORY;
+    let removed = 0;
+    TRACKER.people = TRACKER.people.filter(p => {
+      if (!p.active && removed < toRemove) { removed++; return false; }
+      return true;
+    });
   }
+
+  updateVisitorListFromTracker();
 }
 
 function getZoneForPoint(cx, cy) {
@@ -1300,23 +1355,40 @@ function getZoneForPoint(cx, cy) {
 
 function updateVisitorListFromTracker() {
   const el = document.getElementById('visitorList');
-  const all = [...TRACKER.people].reverse().slice(0, 12);
+  const active   = TRACKER.people.filter(p => p.active).sort((a,b) => a.id - b.id);
+  const inactive = TRACKER.people.filter(p => !p.active).sort((a,b) => b.lastSeen - a.lastSeen).slice(0, 8);
+  const all = [...active, ...inactive];
+
   if (all.length === 0) {
-    el.innerHTML = '<div style="text-align:center;padding:20px;color:var(--muted);font-size:0.75rem">Nenhuma pessoa detectada ainda</div>';
+    el.innerHTML = '<div style="text-align:center;padding:24px;color:var(--muted);font-size:0.75rem">Nenhuma pessoa detectada ainda</div>';
     return;
   }
+
   el.innerHTML = all.map(p => {
     const dur = p.active
       ? Math.floor((Date.now() - p.firstSeen) / 1000)
       : Math.floor((p.lastSeen - p.firstSeen) / 1000);
+    const conf = p.score ? Math.round(p.score * 100) : '—';
+    const zones = p.pathZones.join(' → ');
     return `
-      <div class="visitor-item ${p.active ? 'active' : ''}">
-        <div class="visitor-avatar">${p.active ? '🚶' : '✓'}</div>
-        <div class="visitor-info">
-          <div class="visitor-id">PES-${String(p.id).padStart(3,'0')}</div>
-          <div class="visitor-status">${p.active ? '🔴 Na loja · Zona '+p.zone : '✅ Saiu · '+p.pathZones.join('→')}</div>
+      <div class="visitor-item ${p.active ? 'active' : ''}" style="border-left:3px solid ${p.active ? 'var(--cyan)' : 'var(--border2)'}">
+        <div class="visitor-avatar" style="background:${p.active ? 'rgba(0,212,255,0.15)' : 'var(--card2)'}">
+          ${p.active ? '🚶' : '✓'}
         </div>
-        <div class="visitor-time">${fmtSec(dur)}</div>
+        <div class="visitor-info">
+          <div class="visitor-id" style="font-size:0.72rem;font-weight:700">
+            ID <span style="color:${p.active ? 'var(--cyan)' : 'var(--muted)'}">#${String(p.id).padStart(3,'0')}</span>
+            <span style="font-size:0.58rem;color:var(--muted);margin-left:6px">${conf}% conf.</span>
+          </div>
+          <div class="visitor-status" style="font-size:0.65rem">
+            ${p.active
+              ? `🔴 Na loja · <b style="color:var(--orange)">${p.zone}</b> · ${zones}`
+              : `✅ Saiu · ${zones}`}
+          </div>
+        </div>
+        <div class="visitor-time" style="color:${p.active ? 'var(--green)' : 'var(--muted)'}">
+          ${fmtSec(dur)}
+        </div>
       </div>`;
   }).join('');
 }
