@@ -1108,7 +1108,6 @@ const TRACKER = {
 };
 
 // Heatmap acumulado
-const gazeHeat = new Array(HMAP_COLS * HMAP_ROWS).fill(0);
 let currDetections = []; // últimas detecções brutas do modelo
 
 // ── Carregar modelo ──
@@ -1152,20 +1151,10 @@ async function runDetection() {
       area: (p.bbox[2] * p.bbox[3]) / (vw * vh), // área normalizada
     }));
 
-    // Heatmap com centróides
+    // Adicionar pontos ao KDE heatmap (centróide de cada pessoa)
     normalized.forEach(p => {
-      const hc = Math.min(HMAP_COLS-1, Math.floor(p.cx * HMAP_COLS));
-      const hr = Math.min(HMAP_ROWS-1, Math.floor(p.cy * HMAP_ROWS));
-      for (let dr = -2; dr <= 2; dr++) {
-        for (let dc = -2; dc <= 2; dc++) {
-          const nc = hc+dc, nr = hr+dr;
-          if (nc<0||nc>=HMAP_COLS||nr<0||nr>=HMAP_ROWS) continue;
-          const dist = Math.sqrt(dc*dc+dr*dr);
-          gazeHeat[nr*HMAP_COLS+nc] += Math.exp(-dist*0.8) * p.score;
-        }
-      }
+      addHeatPoint(p.cx, p.cy, p.score);
     });
-    for (let i = 0; i < gazeHeat.length; i++) gazeHeat[i] *= 0.992;
 
     // Tracker com ID persistente
     updateTracker(normalized);
@@ -1185,15 +1174,14 @@ async function runDetection() {
     });
     document.getElementById('zonesActive').textContent = zonesActive;
 
-    // Barras de atenção heatmap
+    // Barras de atenção baseadas em heatPoints (KDE)
     const qHeat = [0,0,0,0];
-    gazeHeat.forEach((v,i) => {
-      const col = i%HMAP_COLS, row = Math.floor(i/HMAP_COLS);
-      const isLeft = col<HMAP_COLS/2, isTop = row<HMAP_ROWS/2;
-      if      (isTop&&isLeft)  qHeat[0]+=v;
-      else if (isTop&&!isLeft) qHeat[1]+=v;
-      else if (!isTop&&isLeft) qHeat[2]+=v;
-      else                     qHeat[3]+=v;
+    heatPoints.forEach(pt => {
+      const isLeft = pt.x < 0.5, isTop = pt.y < 0.5;
+      if      (isTop&&isLeft)  qHeat[0]+=pt.w;
+      else if (isTop&&!isLeft) qHeat[1]+=pt.w;
+      else if (!isTop&&isLeft) qHeat[2]+=pt.w;
+      else                     qHeat[3]+=pt.w;
     });
     const qTotal = qHeat.reduce((a,b)=>a+b,0)||1;
     ['gazeA','gazeB','gazeC','gazeD'].forEach((id,i) => {
@@ -1749,10 +1737,216 @@ function drawOverlay(grid, zoneMotion, blobs) {
 }
 
 // ══════════════════════════════════════════
-//  HEATMAP OVERLAY + PAINEL GRANDE
+//  HEATMAP KDE — Kernel Density Estimation
+//  Resolução pixel-a-pixel com gaussiana 2D
+//  Mesmo algoritmo do Hotjar / Google Analytics
 // ══════════════════════════════════════════
 let heatmapOverlayOn = false;
 let heatFrameCount   = 0;
+
+// Buffer de pontos brutos (centróides de pessoas detectadas)
+// Cada ponto: { x, y, weight, ts }
+const heatPoints = [];
+const HEAT_MAX_POINTS = 2000; // janela histórica
+
+// Parâmetros KDE
+const KDE = {
+  bandwidth: 0.12,   // sigma da gaussiana (% do frame) — maior = mais suave
+  minOpacity: 0.0,
+  decay: 0.9985,     // decay por frame (pontos antigos perdem peso)
+};
+
+// Paleta de cores profissional — 256 entradas RGBA pré-calculadas
+// Escala: transparente → azul → ciano → verde → amarelo → laranja → vermelho
+const PALETTE = (function() {
+  const stops = [
+    [0,   [0,   0,   0,   0  ]],  // 0%   → transparente
+    [0.10,[0,   0,   128, 80 ]],  // 10%  → azul escuro
+    [0.25,[0,   30,  255, 140]],  // 25%  → azul
+    [0.40,[0,   220, 220, 180]],  // 40%  → ciano
+    [0.55,[0,   255, 80,  210]],  // 55%  → verde
+    [0.68,[200, 255, 0,   230]],  // 68%  → verde-amarelo
+    [0.80,[255, 200, 0,   240]],  // 80%  → amarelo
+    [0.90,[255, 100, 0,   245]],  // 90%  → laranja
+    [1.00,[255, 0,   0,   255]],  // 100% → vermelho
+  ];
+  const palette = new Uint8ClampedArray(256 * 4);
+  for (let i = 0; i < 256; i++) {
+    const t = i / 255;
+    let lo = stops[0], hi = stops[stops.length-1];
+    for (let s = 0; s < stops.length-1; s++) {
+      if (t >= stops[s][0] && t <= stops[s+1][0]) { lo=stops[s]; hi=stops[s+1]; break; }
+    }
+    const f = hi[0] === lo[0] ? 0 : (t - lo[0]) / (hi[0] - lo[0]);
+    palette[i*4+0] = Math.round(lo[1][0] + f*(hi[1][0]-lo[1][0]));
+    palette[i*4+1] = Math.round(lo[1][1] + f*(hi[1][1]-lo[1][1]));
+    palette[i*4+2] = Math.round(lo[1][2] + f*(hi[1][2]-lo[1][2]));
+    palette[i*4+3] = Math.round(lo[1][3] + f*(hi[1][3]-lo[1][3]));
+  }
+  return palette;
+})();
+
+// Adicionar ponto ao buffer (chamado a cada detecção de pessoa)
+function addHeatPoint(normX, normY, weight=1.0) {
+  heatPoints.push({ x: normX, y: normY, w: weight, ts: Date.now() });
+  if (heatPoints.length > HEAT_MAX_POINTS) heatPoints.shift();
+}
+
+// KDE pixel-a-pixel em baixa resolução + upscale com ImageSmoothingQuality
+function computeKDE(W, H) {
+  // Renderizar em 1/4 da resolução para performance, depois upscalar
+  const SW = Math.floor(W / 3), SH = Math.floor(H / 3);
+  const density = new Float32Array(SW * SH);
+  const sigma   = KDE.bandwidth;
+  const sigma2  = 2 * sigma * sigma;
+  const now     = Date.now();
+
+  heatPoints.forEach(pt => {
+    // Peso por tempo — pontos mais antigos valem menos
+    const age     = (now - pt.ts) / 1000; // segundos
+    const timeFactor = Math.exp(-age * 0.015); // meia-vida ~46s
+    const w       = pt.w * timeFactor;
+    if (w < 0.01) return;
+
+    // Bounding box do kernel (3 sigmas = 99.7% da gaussiana)
+    const cx   = pt.x * SW, cy = pt.y * SH;
+    const r    = Math.ceil(sigma * Math.max(SW, SH) * 3);
+    const xMin = Math.max(0, Math.floor(cx - r));
+    const xMax = Math.min(SW-1, Math.ceil(cx + r));
+    const yMin = Math.max(0, Math.floor(cy - r));
+    const yMax = Math.min(SH-1, Math.ceil(cy + r));
+
+    for (let py = yMin; py <= yMax; py++) {
+      for (let px = xMin; px <= xMax; px++) {
+        const dx = (px - cx) / SW, dy = (py - cy) / SH;
+        const g  = Math.exp(-(dx*dx + dy*dy) / sigma2);
+        density[py * SW + px] += g * w;
+      }
+    }
+  });
+
+  return { density, SW, SH };
+}
+
+// Renderizar heatmap KDE num canvas
+function renderKDE(ctx, W, H, alpha=1.0, showZones=true, showGrid=true) {
+  if (heatPoints.length === 0) {
+    ctx.clearRect(0, 0, W, H);
+    ctx.fillStyle = '#060a0d';
+    ctx.fillRect(0, 0, W, H);
+    if (showZones) drawZoneLabels(ctx, W, H);
+    return;
+  }
+
+  const { density, SW, SH } = computeKDE(W, H);
+
+  // Normalizar 0-1
+  let maxD = 0;
+  for (let i = 0; i < density.length; i++) if (density[i] > maxD) maxD = density[i];
+  if (maxD === 0) return;
+
+  // Criar ImageData na resolução pequena
+  const imgData = new ImageData(SW, SH);
+  for (let i = 0; i < density.length; i++) {
+    const t   = density[i] / maxD;
+    const idx = Math.min(255, Math.floor(t * 255));
+    imgData.data[i*4+0] = PALETTE[idx*4+0];
+    imgData.data[i*4+1] = PALETTE[idx*4+1];
+    imgData.data[i*4+2] = PALETTE[idx*4+2];
+    imgData.data[i*4+3] = Math.floor(PALETTE[idx*4+3] * alpha);
+  }
+
+  // Offscreen canvas pequeno
+  const offscreen = document.createElement('canvas');
+  offscreen.width = SW; offscreen.height = SH;
+  offscreen.getContext('2d').putImageData(imgData, 0, 0);
+
+  // Upscale com smoothing máximo → elimina efeito pixelado
+  ctx.save();
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = 'high';
+  ctx.drawImage(offscreen, 0, 0, W, H);
+  ctx.restore();
+
+  // Zonas + grid
+  if (showGrid) drawZoneGrid(ctx, W, H);
+  if (showZones) drawZoneLabels(ctx, W, H);
+}
+
+function drawZoneGrid(ctx, W, H) {
+  ctx.save();
+  ctx.strokeStyle = 'rgba(255,255,255,0.15)';
+  ctx.lineWidth = 1;
+  ctx.setLineDash([5, 5]);
+  ctx.beginPath();
+  ctx.moveTo(W/2, 0); ctx.lineTo(W/2, H);
+  ctx.moveTo(0, H/2); ctx.lineTo(W, H/2);
+  ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.restore();
+}
+
+function drawZoneLabels(ctx, W, H) {
+  const zColors = ['#00d4ff','#ff7a2f','#2ecc8a','#a855f7'];
+  const zLabels = ['A · Entrada','B · Produtos','C · Caixa','D · Vitrine'];
+  const positions = [[6,16],[W/2+6,16],[6,H/2+16],[W/2+6,H/2+16]];
+  ctx.save();
+  positions.forEach(([x,y],i) => {
+    ctx.font = "bold 10px 'Space Mono', monospace";
+    // Sombra para legibilidade sobre o heatmap
+    ctx.shadowColor = '#000';
+    ctx.shadowBlur = 4;
+    ctx.fillStyle = zColors[i];
+    ctx.fillText(zLabels[i], x, y);
+  });
+  ctx.shadowBlur = 0;
+  ctx.restore();
+}
+
+function drawHotspot(ctx, W, H) {
+  if (heatPoints.length < 3) return;
+  // Encontrar ponto de maior densidade
+  const { density, SW, SH } = computeKDE(W, H);
+  let maxIdx = 0;
+  for (let i = 1; i < density.length; i++) if (density[i] > density[maxIdx]) maxIdx = i;
+  if (density[maxIdx] < 0.01) return;
+
+  const hx = (maxIdx % SW) / SW * W;
+  const hy = Math.floor(maxIdx / SW) / SH * H;
+
+  ctx.save();
+  // Crosshair animado
+  const t = (Date.now() % 2000) / 2000;
+  const pulse = 4 + Math.sin(t * Math.PI * 2) * 2;
+
+  ctx.strokeStyle = 'rgba(255,255,255,0.5)';
+  ctx.lineWidth = 0.5;
+  ctx.setLineDash([4,4]);
+  ctx.beginPath();
+  ctx.moveTo(hx, 0); ctx.lineTo(hx, H);
+  ctx.moveTo(0, hy); ctx.lineTo(W, hy);
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  // Círculo pulsante
+  ctx.beginPath();
+  ctx.arc(hx, hy, pulse, 0, Math.PI*2);
+  ctx.strokeStyle = '#fff';
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+
+  // Label
+  const label = '🔥 HOTSPOT';
+  ctx.font = "bold 9px 'Space Mono'";
+  ctx.shadowColor='#000'; ctx.shadowBlur=6;
+  ctx.fillStyle='#fff';
+  const lx = hx + 10 > W - 60 ? hx - 62 : hx + 10;
+  ctx.fillText(label, lx, hy - 8);
+  ctx.shadowBlur = 0;
+  ctx.restore();
+}
+
+// ── Overlay na câmera em tempo real ──
 const hmCanvas = document.getElementById('heatmapOverlay');
 const hmCtx    = hmCanvas ? hmCanvas.getContext('2d') : null;
 
@@ -1761,7 +1955,6 @@ function toggleHeatmapOverlay() {
   const btn = document.getElementById('heatmapToggleBtn');
   if (heatmapOverlayOn) {
     hmCanvas.style.display = 'block';
-    hmCanvas.style.opacity = '0.85';
     btn.classList.add('on');
     btn.textContent = '🔥 Heat ON';
   } else {
@@ -1771,125 +1964,84 @@ function toggleHeatmapOverlay() {
   }
 }
 
-function clearHeatmap() {
-  gazeHeat.fill(0);
-  heatFrameCount = 0;
-  ['heatFrames','heatMaxVal'].forEach(id => document.getElementById(id).textContent = '0');
-  document.getElementById('heatCoverage').textContent = '0%';
-  document.getElementById('heatHotZone').textContent = '—';
-  addLog('🔥 Heatmap limpo', 'y');
-}
-
-// Converte 0-1 em cor de heatmap (azul→ciano→verde→amarelo→vermelho)
-function heatColor(t) {
-  const stops = [[0,0,128],[0,0,255],[0,255,255],[0,255,0],[255,255,0],[255,128,0],[255,0,0]];
-  const pos = t * (stops.length - 1);
-  const lo = Math.floor(pos), hi = Math.min(lo+1, stops.length-1), f = pos-lo;
-  return stops[lo].map((c,i) => Math.round(c + f*(stops[hi][i]-c)));
-}
-
 function renderHeatmapOverlay() {
   if (!hmCanvas || !hmCtx || !overlayCanvas.width) return;
   hmCanvas.width  = overlayCanvas.width;
   hmCanvas.height = overlayCanvas.height;
-  const W = hmCanvas.width, H = hmCanvas.height;
-  hmCtx.clearRect(0, 0, W, H);
-  const maxVal = Math.max(...gazeHeat, 0.001);
-  const cw = W/HMAP_COLS, ch = H/HMAP_ROWS;
-  gazeHeat.forEach((v,i) => {
-    const t = v/maxVal;
-    if (t < 0.06) return;
-    const col = i%HMAP_COLS, row = Math.floor(i/HMAP_COLS);
-    const cx = col*cw+cw/2, cy = row*ch+ch/2, r2 = Math.max(cw,ch)*1.6;
-    const [r,g,b] = heatColor(t);
-    const grad = hmCtx.createRadialGradient(cx,cy,0,cx,cy,r2);
-    grad.addColorStop(0,   `rgba(${r},${g},${b},${Math.min(0.75, t*0.8+0.1)})`);
-    grad.addColorStop(1,   `rgba(${r},${g},${b},0)`);
-    hmCtx.fillStyle = grad;
-    hmCtx.beginPath(); hmCtx.arc(cx,cy,r2,0,Math.PI*2); hmCtx.fill();
-  });
+  hmCtx.clearRect(0, 0, hmCanvas.width, hmCanvas.height);
+  renderKDE(hmCtx, hmCanvas.width, hmCanvas.height, 0.72, false, false);
 }
 
+function clearHeatmap() {
+  heatPoints.length = 0;
+  heatFrameCount = 0;
+  ['heatFrames','heatMaxVal'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.textContent = '0';
+  });
+  const c1 = document.getElementById('heatCoverage');
+  const c2 = document.getElementById('heatHotZone');
+  if (c1) c1.textContent = '0%';
+  if (c2) c2.textContent = '—';
+  addLog('🔥 Heatmap limpo', 'y');
+}
+
+// ── Painel grande (tab Atenção) ──
 function renderGazeHeatmap() {
-  // Painel grande (tab Atenção)
   const gc = document.getElementById('gazeCanvasLarge');
   if (!gc) return;
   const GW = gc.width  = gc.parentElement ? gc.parentElement.clientWidth : 360;
-  const GH = gc.height = 260;
+  const GH = gc.height = 280;
   const ctx = gc.getContext('2d');
-  ctx.clearRect(0,0,GW,GH);
-  ctx.fillStyle='#060a0d'; ctx.fillRect(0,0,GW,GH);
 
-  const maxVal = Math.max(...gazeHeat, 0.001);
-  const cw = GW/HMAP_COLS, ch = GH/HMAP_ROWS;
-  let activeCells = 0, maxIdx = 0;
+  // Fundo escuro
+  ctx.fillStyle = '#060a0d';
+  ctx.fillRect(0, 0, GW, GH);
 
-  gazeHeat.forEach((v,i) => {
-    if(v > gazeHeat[maxIdx]) maxIdx = i;
-    const t = v/maxVal;
-    if(t < 0.02) return;
-    activeCells++;
-    const col = i%HMAP_COLS, row = Math.floor(i/HMAP_COLS);
-    const cx = col*cw+cw/2, cy = row*ch+ch/2, radius = Math.max(cw,ch)*1.5;
-    const [r,g,b] = heatColor(t);
-    const grad = ctx.createRadialGradient(cx,cy,0,cx,cy,radius);
-    grad.addColorStop(0, `rgba(${r},${g},${b},${Math.min(0.9,t*0.9+0.15)})`);
-    grad.addColorStop(0.5,`rgba(${r},${g},${b},${Math.min(0.5,t*0.5)})`);
-    grad.addColorStop(1, `rgba(${r},${g},${b},0)`);
-    ctx.fillStyle=grad; ctx.beginPath(); ctx.arc(cx,cy,radius,0,Math.PI*2); ctx.fill();
-  });
+  // Render KDE
+  renderKDE(ctx, GW, GH, 1.0, true, true);
 
-  // Zonas
-  const zColors=['#00d4ff','#ff7a2f','#2ecc8a','#a855f7'];
-  const zLabels=['A · Entrada','B · Produtos','C · Caixa','D · Vitrine'];
-  [[0,0],[GW/2,0],[0,GH/2],[GW/2,GH/2]].forEach(([x,y],i)=>{
-    ctx.strokeStyle=zColors[i]+'55'; ctx.lineWidth=1; ctx.setLineDash([4,4]);
-    ctx.strokeRect(x+1,y+1,GW/2-2,GH/2-2); ctx.setLineDash([]);
-    ctx.font="bold 10px 'Space Mono',monospace";
-    ctx.fillStyle=zColors[i]+'cc'; ctx.fillText(zLabels[i],x+6,y+14);
-  });
+  // Hotspot marker
+  drawHotspot(ctx, GW, GH);
 
-  // Crosshair ponto mais quente
-  if(gazeHeat[maxIdx]>0.1){
-    const hcol=maxIdx%HMAP_COLS, hrow=Math.floor(maxIdx/HMAP_COLS);
-    const hx=hcol*cw+cw/2, hy=hrow*ch+ch/2;
-    ctx.strokeStyle='#ffffff66'; ctx.lineWidth=1; ctx.setLineDash([3,3]);
-    ctx.beginPath(); ctx.moveTo(hx,0); ctx.lineTo(hx,GH); ctx.stroke();
-    ctx.beginPath(); ctx.moveTo(0,hy); ctx.lineTo(GW,hy); ctx.stroke();
-    ctx.setLineDash([]);
-    ctx.beginPath(); ctx.arc(hx,hy,6,0,Math.PI*2);
-    ctx.strokeStyle='#fff'; ctx.lineWidth=2; ctx.stroke();
-  }
-
-  // Atualizar stats
+  // Stats
   heatFrameCount++;
-  document.getElementById('heatFrames').textContent = heatFrameCount;
-  document.getElementById('heatMaxVal').textContent = maxVal.toFixed(1);
+  document.getElementById('heatFrames').textContent = heatPoints.length;
+
+  // Calcular calor por zona
+  const zHeat = [0,0,0,0];
+  const zLabels = ['A · Entrada','B · Produtos','C · Caixa','D · Vitrine'];
+  heatPoints.forEach(pt => {
+    const isLeft = pt.x < 0.5, isTop = pt.y < 0.5;
+    if      (isTop  && isLeft)  zHeat[0] += pt.w;
+    else if (isTop  && !isLeft) zHeat[1] += pt.w;
+    else if (!isTop && isLeft)  zHeat[2] += pt.w;
+    else                        zHeat[3] += pt.w;
+  });
+  const zMax   = Math.max(...zHeat, 0.001);
+  const hotIdx = zHeat.indexOf(Math.max(...zHeat));
+  const qTotal = zHeat.reduce((a,b)=>a+b,0)||1;
+
+  document.getElementById('heatHotZone').textContent  = zLabels[hotIdx] || '—';
+  document.getElementById('heatMaxVal').textContent   = heatPoints.length;
   document.getElementById('heatCoverage').textContent =
-    Math.round((activeCells/gazeHeat.length)*100)+'%';
-  const zHeat=[0,0,0,0];
-  gazeHeat.forEach((v,i)=>{
-    const col=i%HMAP_COLS, row=Math.floor(i/HMAP_COLS);
-    const isLeft=col<HMAP_COLS/2, isTop=row<HMAP_ROWS/2;
-    if(isTop&&isLeft) zHeat[0]+=v;
-    else if(isTop&&!isLeft) zHeat[1]+=v;
-    else if(!isTop&&isLeft) zHeat[2]+=v;
-    else zHeat[3]+=v;
-  });
-  const hotIdx=zHeat.indexOf(Math.max(...zHeat));
-  document.getElementById('heatHotZone').textContent=zLabels[hotIdx]||'—';
+    Math.round((heatPoints.length / HEAT_MAX_POINTS) * 100) + '%';
 
-  // Barras de atenção por zona
-  const qTotal=zHeat.reduce((a,b)=>a+b,0)||1;
-  ['gazeA','gazeB','gazeC','gazeD'].forEach((id,i)=>{
-    const pct=Math.round((zHeat[i]/qTotal)*100);
-    document.getElementById(id).style.width=pct+'%';
-    document.getElementById(id+'pct').textContent=pct+'%';
+  // Barras de atenção
+  ['gazeA','gazeB','gazeC','gazeD'].forEach((id,i) => {
+    const pct = Math.round((zHeat[i]/qTotal)*100);
+    const el  = document.getElementById(id);
+    const ep  = document.getElementById(id+'pct');
+    if (el) el.style.width = pct+'%';
+    if (ep) ep.textContent = pct+'%';
   });
 
-  // Overlay na câmera se ativo
-  if(heatmapOverlayOn) renderHeatmapOverlay();
+  // Overlay na câmera
+  if (heatmapOverlayOn) renderHeatmapOverlay();
 }
+
+// ── Integração com TRACKER: adicionar ponto a cada detecção ──
+// (chamado dentro do runDetection após normalizar as detecções)
 
 // ══════════════════════════════════════════
 //  HISTORY CHART
@@ -2014,7 +2166,7 @@ function resetSession() {
   totalVisits = 0; peakOccupancy = 0; peakTime = null; alertCount = 0;
   visitDurations = []; occupancyHistory = [];
   Object.keys(ZONES).forEach(k => { ZONES[k].count = 0; ZONES[k].seconds = 0; });
-  gazeHeat.fill(0);
+  clearHeatmap();
   TRACKER.people = []; TRACKER.nextId = 1;
   ['A','B','C','D'].forEach(k => { zoneActiveTimers[k] = 0; });
   ['totalToday','peakCount','aAlerts','aTotalVisits'].forEach(id => {
